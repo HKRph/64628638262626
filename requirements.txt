@@ -1,0 +1,5 @@
+python-telegram-bot[ext]
+sqlalchemy
+fastapi
+uvicorn
+python-dotenv
