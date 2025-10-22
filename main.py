@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = "8486136204:AAFZkkxVFlBK1S5_RzrOlZ4ZZ6cDBcBjqVY"
 BOT_USERNAME = "GTaskPHBot"
 ADMIN_CHAT_ID = 7331257920
-MINI_APP_URL = "https://your-frontend-url.vercel.app" # IMPORTANT: We will replace this in the final step
+MINI_APP_URL = "https://gtask-fronted.vercel.app" # IMPORTANT: We will replace this in the final step
 INVITE_REWARD = 10.0
 MIN_WITHDRAWAL = 500.0
 
