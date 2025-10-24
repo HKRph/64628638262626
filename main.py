@@ -1,9 +1,9 @@
-import logging, json, uvicorn, os, base64, random
+import logging, json, uvicorn, os, base64, random, asyncio
 from io import BytesIO
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
-from typing import Optional
-from fastapi import FastAPI, Request, HTTPException, status
+from typing import Optional, Dict, List
+from fastapi import FastAPI, Request, HTTPException, status, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, InputFile
 from telegram.ext import (
@@ -13,11 +13,14 @@ from telegram.ext import (
 from sqlalchemy import create_engine, Column, Integer, BigInteger, String, Float, ForeignKey, Text, Date
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-# --- Configuration ---
+# --- Configuration & Logging ---
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 BOT_TOKEN = "8486136204:AAFZkkxVFlBK1S5_RzrOlZ4ZZ6cDBcBjqVY"
 BOT_USERNAME = "GTaskPHBot"
 ADMIN_CHAT_ID = 7331257920 # IMPORTANT: Replace with your actual Admin Telegram User ID
-MINI_APP_URL = "https://gtask-fronted.vercel.app/" # YOUR FRONTEND URL
+MINI_APP_URL = "https://gtask-fronted.vercel.app/" # IMPORTANT: Your Vercel Frontend URL
 INVITE_REWARD = 77.0 # Reward for a successful referral (when referred user completes first task)
 MIN_WITHDRAWAL = 300.0 # Minimum amount a user can withdraw
 MAX_WITHDRAWAL = 30000.0 # Maximum amount a user can withdraw
@@ -29,11 +32,10 @@ GIFT_TICKET_PRICE = 77.0
 GIFT_MIN_AMOUNT = 300.0
 GIFT_MAX_AMOUNT = 80000.0
 GIFT_FEE_PERCENT = 0.05 # 5% fee
+GAME_FEE_PERCENT = 0.10 # 10% fee for Jack and Poy winner
+MIN_GAME_BET = 10.0 # Minimum bet for Jack and Poy
 
 # --- Database Setup ---
-logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 Base = declarative_base()
 class User(Base):
     __tablename__ = "users"
@@ -91,14 +93,26 @@ class SystemInfo(Base):
     key = Column(String, primary_key=True)
     value = Column(String)
 
+class GameRoom(Base):
+    __tablename__ = "game_rooms"
+    id = Column(Integer, primary_key=True)
+    bet_amount = Column(Float)
+    creator_id = Column(BigInteger)
+    opponent_id = Column(BigInteger, nullable=True)
+    status = Column(String, default="pending") # pending, active, finished, cancelled
+    winner_id = Column(BigInteger, nullable=True) # ID of the winner, or -1 for draw
+    creator_move = Column(String, nullable=True) # rock, paper, scissors
+    opponent_move = Column(String, nullable=True) # rock, paper, scissors
+    created_at = Column(Date, default=date.today())
+
 engine = create_engine("sqlite:///gtask_data.db") # Using a specific DB name for clarity
 Base.metadata.create_all(engine); Session = sessionmaker(bind=engine); db_session = Session()
 
-# --- Conversation States (FIXED AND EXPLICITLY DEFINED) ---
+# --- Conversation States (Explicitly defined for clarity and reliability) ---
 STATE_TASK_DESC = 0
 STATE_TASK_LINK = 1
 STATE_TASK_REWARD = 2
-STATE_REJECT_WD_REASON = 3
+STATE_REJECT_WD_REASON = 3 # For withdrawal rejection
 STATE_BROADCAST_MESSAGE = 4
 STATE_ANNOUNCEMENT_TEXT = 5
 STATE_NEW_CODE_CODE = 6
@@ -109,15 +123,41 @@ STATE_USER_MGT_ACTION = 10
 STATE_USER_MGT_DURATION = 11
 STATE_RAIN_AMOUNT = 12
 STATE_RAIN_USERS = 13
-STATE_REJECT_SUB_REASON = 14
+STATE_REJECT_SUB_REASON = 14 # For task submission rejection
 STATE_DELETE_TASK = 15
 STATE_DELETE_CODE = 16
 STATE_WARN_USER_ID = 17
 STATE_WARN_REASON = 18
 
 # Assigning to readable names for use in ConversationHandler
-TASK_DESC, TASK_LINK, TASK_REWARD, REJECT_REASON_WD, BROADCAST_MESSAGE, ANNOUNCEMENT_TEXT, NEW_CODE_CODE, NEW_CODE_REWARD, NEW_CODE_USES, USER_MGT_ID, USER_MGT_ACTION, USER_MGT_DURATION, RAIN_AMOUNT, RAIN_USERS, SUBMIT_TASK_REJECT_REASON, DELETE_TASK, DELETE_CODE, WARN_USER_ID, WARN_REASON = range(19)
+TASK_DESC, TASK_LINK, TASK_REWARD, REJECT_REASON_WD, BROADCAST_MESSAGE, ANNOUNCEMENT_TEXT, \
+NEW_CODE_CODE, NEW_CODE_REWARD, NEW_CODE_USES, USER_MGT_ID, USER_MGT_DURATION, \
+RAIN_AMOUNT, RAIN_USERS, SUBMIT_TASK_REJECT_REASON, DELETE_TASK, DELETE_CODE, \
+WARN_USER_ID, WARN_REASON = range(18)
 
+
+# --- Game Logic & WebSocket Manager ---
+class ConnectionManager:
+    def __init__(self): self.active_connections: Dict[int, List[WebSocket]] = {} # room_id -> [websocket1, websocket2]
+    async def connect(self, room_id: int, websocket: WebSocket):
+        if room_id not in self.active_connections: self.active_connections[room_id] = []
+        self.active_connections[room_id].append(websocket)
+        logger.info(f"WebSocket connected to room {room_id}. Total connections: {len(self.active_connections[room_id])}")
+    
+    def disconnect(self, room_id: int, websocket: WebSocket):
+        if room_id in self.active_connections:
+            self.active_connections[room_id].remove(websocket)
+            if not self.active_connections[room_id]:
+                self.active_connections.pop(room_id, None) # Remove room if no active connections
+        logger.info(f"WebSocket disconnected from room {room_id}. Remaining: {self.active_connections.get(room_id, [])}")
+    
+    async def broadcast(self, room_id: int, message: str):
+        if room_id in self.active_connections:
+            for connection in self.active_connections[room_id]:
+                try: await connection.send_text(message)
+                except RuntimeError: # Handle connection already closed
+                    logger.warning(f"Failed to send to closed websocket in room {room_id}")
+manager = ConnectionManager()
 
 # --- Bot & API Lifespan ---
 ptb_app = Application.builder().token(BOT_TOKEN).build()
@@ -143,8 +183,7 @@ app.add_middleware(
 
 # --- API Endpoints ---
 @app.get("/")
-async def health_check():
-    return {"status": "ok", "message": f"{BOT_USERNAME} API is running!"}
+async def health_check(): return {"status": "ok", "message": f"{BOT_USERNAME} API is running!"}
 
 @app.post("/get_initial_data")
 async def get_initial_data(request: Request):
@@ -155,7 +194,7 @@ async def get_initial_data(request: Request):
         user = db_session.query(User).filter(User.id == user_id).first()
         if not user: user = User(id=user_id); db_session.add(user); db_session.commit()
         
-        # Check user status for Mini App access
+        # Check user status
         if user.status == 'banned': raise HTTPException(status_code=403, detail="You are permanently banned.")
         if user.status == 'restricted' and user.status_until and user.status_until > date.today():
             raise HTTPException(status_code=403, detail=f"You are restricted until {user.status_until.strftime('%b %d')}.")
@@ -165,13 +204,13 @@ async def get_initial_data(request: Request):
         can_claim_daily = (user.last_login_date is None or user.last_login_date < date.today()) and user.daily_claim_invites >= DAILY_BONUS_INVITE_REQ
         
         tasks = db_session.query(Task).all()
-        # Filter tasks already completed by the user
         completed_task_ids_list = json.loads(user.completed_task_ids) if user.completed_task_ids else []
         available_tasks = [t for t in tasks if t.id not in completed_task_ids_list]
 
         withdrawals = db_session.query(Withdrawal).filter(Withdrawal.user_id == user_id).order_by(Withdrawal.created_at.desc()).all()
         announcement = db_session.query(SystemInfo).filter(SystemInfo.key == 'announcement').first()
         withdrawal_maintenance = db_session.query(SystemInfo).filter(SystemInfo.key == 'withdrawal_maintenance').first()
+        game_rooms = db_session.query(GameRoom).filter(GameRoom.status == 'pending', GameRoom.creator_id != user_id, GameRoom.opponent_id == None).all()
         
         return {
             "balance": user.balance,
@@ -193,7 +232,9 @@ async def get_initial_data(request: Request):
             "gift_ticket_price": GIFT_TICKET_PRICE,
             "gift_min_amount": GIFT_MIN_AMOUNT,
             "gift_max_amount": GIFT_MAX_AMOUNT,
-            "gift_fee_percent": GIFT_FEE_PERCENT
+            "gift_fee_percent": GIFT_FEE_PERCENT,
+            "min_game_bet": MIN_GAME_BET,
+            "game_rooms": [{"id": r.id, "bet": r.bet_amount, "creator_id": r.creator_id} for r in game_rooms]
         }
     except HTTPException as he:
         logger.warning(f"API Error for user {user_id}: {he.detail}")
@@ -268,7 +309,7 @@ async def claim_daily_bonus(request: Request):
         else:
             raise HTTPException(status_code=400, detail="Daily bonus already claimed or not yet available.")
     except HTTPException as he: raise he
-    except Exception as e: logger.error(f"API Error in claim_daily_bonus: {e}", exc_info=True); raise HTTPException(status_code=500, detail="Internal server error")
+    except Exception as e: logger.error(f"Error in claim_daily_bonus: {e}", exc_info=True); raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/submit_withdrawal")
 async def submit_withdrawal(request: Request):
@@ -339,7 +380,149 @@ async def gift_money(request: Request):
         await ptb_app.bot.send_message(recipient_id, f"🎉 You have received a gift of ₱{amount:.2f} from user {user_id}!")
         return {"status": "success"}
     except HTTPException as he: raise he
-    except Exception as e: logger.error(f"API Error in gift_money: {e}", exc_info=True); raise HTTPException(status_code=500, detail="Internal server error")
+    except Exception as e: logger.error(f"Error in gift_money: {e}", exc_info=True); raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/create_game_room")
+async def create_game_room(request: Request):
+    try:
+        data = await request.json(); user_id = data.get('user_id'); bet = float(data.get('bet'))
+        user = db_session.query(User).filter(User.id == user_id).first()
+        if not user or user.status != 'active': raise HTTPException(status_code=403, detail="Account not active.")
+        if bet < MIN_GAME_BET: raise HTTPException(status_code=400, detail=f"Minimum bet is ₱{MIN_GAME_BET:.2f}.")
+        if user.balance < bet: raise HTTPException(status_code=400, detail="Insufficient balance.")
+        
+        user.balance -= bet
+        new_room = GameRoom(creator_id=user_id, bet_amount=bet, status='pending', created_at=date.today())
+        db_session.add(new_room); db_session.commit()
+        await ptb_app.bot.send_message(user_id, f"✅ Game room #{new_room.id} created with a bet of ₱{bet:.2f}. Your balance: ₱{user.balance:.2f}.")
+        return {"status": "success", "room_id": new_room.id}
+    except HTTPException as he: raise he
+    except Exception as e: logger.error(f"API Error in create_game_room: {e}", exc_info=True); raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/join_game_room")
+async def join_game_room(request: Request):
+    try:
+        data = await request.json(); user_id = data.get('user_id'); room_id = data.get('room_id')
+        user = db_session.query(User).filter(User.id == user_id).first()
+        room = db_session.query(GameRoom).filter(GameRoom.id == room_id, GameRoom.status == 'pending').first()
+        if not user or user.status != 'active': raise HTTPException(status_code=403, detail="Account not active.")
+        if not room: raise HTTPException(status_code=404, detail="Room not found or is already active.")
+        if user.id == room.creator_id: raise HTTPException(status_code=400, detail="You cannot join your own room.")
+        if user.balance < room.bet_amount: raise HTTPException(status_code=400, detail="Insufficient balance.")
+        
+        user.balance -= room.bet_amount
+        room.opponent_id = user_id; room.status = 'active'; db_session.commit()
+        await ptb_app.bot.send_message(user_id, f"✅ You have joined Game Room #{room_id}. Your balance: ₱{user.balance:.2f}. Play now!")
+        await ptb_app.bot.send_message(room.creator_id, f"🎉 An opponent ({user.first_name}) has joined your Game Room #{room_id}! The game is starting now in your Mini App.")
+        
+        # Broadcast to websockets that the game can start
+        await manager.broadcast(room.id, json.dumps({"type": "game_start"}))
+        return {"status": "success"}
+    except HTTPException as he: raise he
+    except Exception as e: logger.error(f"API Error in join_game_room: {e}", exc_info=True); raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.websocket("/ws/{room_id}/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, room_id: int, user_id: int):
+    await websocket.accept(); await manager.connect(room_id, websocket)
+    try:
+        while True:
+            data_str = await websocket.receive_text(); data = json.loads(data_str)
+            room = db_session.query(GameRoom).filter(GameRoom.id == room_id).first()
+            if not room or room.status != 'active':
+                await websocket.send_text(json.dumps({"type": "error", "message": "Game not active or room not found."})); continue
+
+            if data.get('type') == 'make_move':
+                move = data['move']
+                if user_id == room.creator_id: room.creator_move = move
+                elif user_id == room.opponent_id: room.opponent_move = move
+                else: await websocket.send_text(json.dumps({"type": "error", "message": "Not a player in this room."})); continue
+                db_session.commit()
+                await manager.broadcast(room_id, json.dumps({"type": "move_made", "user_id": user_id}))
+
+                if room.creator_move and room.opponent_move:
+                    winner_id = None; c_move = room.creator_move; o_move = room.opponent_move
+                    game_result = "draw"
+                    if c_move == o_move: game_result = "draw"
+                    elif (c_move == 'rock' and o_move == 'scissors') or \
+                         (c_move == 'scissors' and o_move == 'paper') or \
+                         (c_move == 'paper' and o_move == 'rock'): game_result = "creator_wins"
+                    else: game_result = "opponent_wins"
+                    
+                    room.status = 'finished'
+                    prize_pool = room.bet_amount * 2
+                    fee_amount = prize_pool * GAME_FEE_PERCENT
+                    prize_after_fee = prize_pool - fee_amount
+                    
+                    creator_user = db_session.query(User).filter(User.id == room.creator_id).first()
+                    opponent_user = db_session.query(User).filter(User.id == room.opponent_id).first()
+
+                    if game_result == "draw":
+                        creator_user.balance += room.bet_amount
+                        opponent_user.balance += room.bet_amount
+                        await ptb_app.bot.send_message(room.creator_id, f"The game against {opponent_user.first_name} was a draw! Your bet of ₱{room.bet_amount:.2f} has been returned.")
+                        await ptb_app.bot.send_message(room.opponent_id, f"The game against {creator_user.first_name} was a draw! Your bet of ₱{room.bet_amount:.2f} has been returned.")
+                        room.winner_id = -1 # Special ID for draw
+                    elif game_result == "creator_wins":
+                        creator_user.balance += prize_after_fee
+                        room.winner_id = room.creator_id
+                        await ptb_app.bot.send_message(room.creator_id, f"🎉 You won the game against {opponent_user.first_name}! You received ₱{prize_after_fee:.2f} (Fee: ₱{fee_amount:.2f}).")
+                        await ptb_app.bot.send_message(room.opponent_id, f"You lost the game against {creator_user.first_name}. Better luck next time!")
+                    else: # opponent_wins
+                        opponent_user.balance += prize_after_fee
+                        room.winner_id = room.opponent_id
+                        await ptb_app.bot.send_message(opponent_user.id, f"🎉 You won the game against {creator_user.first_name}! You received ₱{prize_after_fee:.2f} (Fee: ₱{fee_amount:.2f}).")
+                        await ptb_app.bot.send_message(creator_user.id, f"You lost the game against {opponent_user.first_name}. Better luck next time!")
+                    
+                    db_session.commit()
+                    await manager.broadcast(room_id, json.dumps({"type": "game_over", "winner": winner_id, "creator_move": c_move, "opponent_move": o_move}))
+                    manager.disconnect(room_id, websocket) # Disconnect after game over
+            elif data.get('type') == 'request_status':
+                await websocket.send_text(json.dumps({
+                    "type": "game_status",
+                    "room_id": room.id,
+                    "status": room.status,
+                    "creator_id": room.creator_id,
+                    "opponent_id": room.opponent_id,
+                    "creator_move": room.creator_move,
+                    "opponent_move": room.opponent_move,
+                    "winner_id": room.winner_id
+                }))
+
+
+    except WebSocketDisconnect:
+        manager.disconnect(room_id, websocket)
+        room = db_session.query(GameRoom).filter(GameRoom.id == room_id, GameRoom.status == 'active').first()
+        if room:
+            # If one player disconnects during active game, the other wins
+            remaining_player_id = room.creator_id if room.opponent_id == user_id else room.opponent_id
+            if remaining_player_id and remaining_player_id != room.creator_id and remaining_player_id != room.opponent_id:
+                # If the other player is also gone, just refund bets
+                creator = db_session.query(User).filter(User.id == room.creator_id).first()
+                opponent = db_session.query(User).filter(User.id == room.opponent_id).first()
+                if creator: creator.balance += room.bet_amount
+                if opponent: opponent.balance += room.bet_amount
+                db_session.commit()
+                await ptb_app.bot.send_message(room.creator_id, f"Game Room #{room_id} cancelled due to disconnect. Your bet returned.")
+                await ptb_app.bot.send_message(room.opponent_id, f"Game Room #{room_id} cancelled due to disconnect. Your bet returned.")
+            else:
+                # One player left, other player wins
+                winner_id = remaining_player_id
+                loser_id = user_id
+                winner_db = db_session.query(User).filter(User.id == winner_id).first()
+                prize_pool = room.bet_amount * 2
+                fee_amount = prize_pool * GAME_FEE_PERCENT
+                prize_after_fee = prize_pool - fee_amount
+                
+                if winner_db:
+                    winner_db.balance += prize_after_fee
+                    await ptb_app.bot.send_message(winner_id, f"🎉 Opponent disconnected! You win ₱{prize_after_fee:.2f} (Fee: ₱{fee_amount:.2f}).")
+                await ptb_app.bot.send_message(loser_id, "You disconnected from the game and lost your bet.")
+                room.status = 'cancelled'
+                room.winner_id = winner_id
+                db_session.commit()
+    except Exception as e:
+        logger.error(f"WebSocket Error in room {room_id} for user {user_id}: {e}", exc_info=True)
+
 
 # --- Telegram Handlers ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -376,8 +559,9 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📜 Set Announcement", callback_data="admin_set_announcement"), InlineKeyboardButton("📝 Manage Tasks", callback_data="admin_manage_tasks")],
         [InlineKeyboardButton("🔑 Manage Codes", callback_data="admin_manage_codes"), InlineKeyboardButton("🔨 User Management", callback_data="admin_user_mgt")],
         [InlineKeyboardButton("🌧️ Rain Prize", callback_data="admin_rain"), InlineKeyboardButton("🧐 Review Submissions", callback_data="admin_pending_submissions")],
-        [InlineKeyboardButton("⚙️ Maintenance Mode", callback_data="admin_maintenance")],
-        [InlineKeyboardButton("⚠️ Warn User", callback_data="admin_warn_user")]
+        [InlineKeyboardButton("⚙️ Withdrawal Maintenance", callback_data="admin_maintenance")],
+        [InlineKeyboardButton("⚠️ Warn User", callback_data="admin_warn_user")],
+        [InlineKeyboardButton("🎲 Manage Games", callback_data="admin_manage_games")] # New button
     ]
     await update.message.reply_text("👑 **Ultimate Admin Dashboard**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
@@ -394,6 +578,8 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_balance = sum(u.balance for u in db_session.query(User).all())
     pending_withdrawals = db_session.query(Withdrawal).filter(Withdrawal.status == 'pending').count()
     pending_submissions = db_session.query(TaskSubmission).filter(TaskSubmission.status == 'pending').count()
+    active_game_rooms = db_session.query(GameRoom).filter(GameRoom.status == 'active').count()
+    pending_game_rooms = db_session.query(GameRoom).filter(GameRoom.status == 'pending').count()
 
     await query.message.reply_text(
         f"**📊 Bot Statistics:**\n\n"
@@ -403,7 +589,9 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🚧 Restricted Users: {restricted_users}\n"
         f"💰 Total Balance in Circulation: ₱{total_balance:.2f}\n"
         f"💸 Pending Withdrawals: {pending_withdrawals}\n"
-        f"📝 Pending Task Submissions: {pending_submissions}",
+        f"📝 Pending Task Submissions: {pending_submissions}\n"
+        f"🎮 Active Game Rooms: {active_game_rooms}\n"
+        f"⏳ Pending Game Rooms: {pending_game_rooms}",
         parse_mode='Markdown'
     )
 
@@ -446,7 +634,7 @@ async def remove_task_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.edit_text("Select a task to remove:", reply_markup=InlineKeyboardMarkup(keyboard));
 async def delete_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; task_id = int(query.data.split("_")[2]); task = db_session.query(Task).filter(Task.id == task_id).first()
-    if task: db_session.delete(task); db_session.commit(); await query.answer("Task removed!", show_alert=True); await remove_task_list(update, context)
+    if task: db_session.delete(task); db_session.commit(); await query.answer("Task removed!", show_alert=True); await manage_tasks(update, context)
     else: await query.answer("Task not found.", show_alert=True)
 
 # --- Manage Codes ---
@@ -461,7 +649,7 @@ async def get_new_code_uses(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uses = int(update.message.text)
         code = RedeemCode(code=context.user_data['new_code_code'], reward=context.user_data['new_code_reward'], uses_left=uses)
         db_session.add(code); db_session.commit(); await update.message.reply_text("✅ Code added!"); return ConversationHandler.END
-    except ValueError: await update.message.reply_text("Invalid uses."); return NEW_CODE_USES
+    except ValueError: await update.message.reply_text("Invalid uses."); return ConversationHandler.END
 
 async def remove_code_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer(); codes = db_session.query(RedeemCode).all()
@@ -470,7 +658,7 @@ async def remove_code_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.edit_text("Select a code to remove:", reply_markup=InlineKeyboardMarkup(keyboard));
 async def delete_code_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; code_id = int(query.data.split("_")[2]); code = db_session.query(RedeemCode).filter(RedeemCode.id == code_id).first()
-    if code: db_session.delete(code); db_session.commit(); await query.answer("Code removed!", show_alert=True); await remove_code_list(update, context)
+    if code: db_session.delete(code); db_session.commit(); await query.answer("Code removed!", show_alert=True); await manage_codes(update, context)
     else: await query.answer("Code not found.", show_alert=True)
 
 # --- User Management ---
@@ -510,13 +698,21 @@ async def rain_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def rain_users_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: num_users = int(update.message.text); amount = context.user_data['rain_amount']
     except ValueError: await update.message.reply_text("Invalid number."); return RAIN_USERS
+    
     eligible_users = db_session.query(User).filter(User.status == 'active').all()
     if len(eligible_users) < num_users: await update.message.reply_text(f"Only {len(eligible_users)} eligible users found."); return ConversationHandler.END
+    
+    # Deduct from admin balance if implemented
+    admin_user = db_session.query(User).filter(User.id == ADMIN_CHAT_ID).first()
+    if admin_user and admin_user.balance < amount:
+        await update.message.reply_text("Admin does not have sufficient balance for this Rain Prize."); return ConversationHandler.END
+    if admin_user: admin_user.balance -= amount
+    
     winners = random.sample(eligible_users, num_users)
     prize_per_user = amount / num_users
-    for user in winners:
-        user.balance += prize_per_user
-        await ptb_app.bot.send_message(user.id, f"🎉 You were in the Rain Prize! You won ₱{prize_per_user:.2f}!")
+    for user_winner in winners: # Renamed to avoid conflict with `user` object in function scope
+        user_winner.balance += prize_per_user
+        await ptb_app.bot.send_message(user_winner.id, f"🎉 You were in the Rain Prize! You won ₱{prize_per_user:.2f}!")
     db_session.commit()
     await update.message.reply_text(f"Rain Prize complete. ₱{amount:.2f} distributed to {num_users} users."); return ConversationHandler.END
 
@@ -559,7 +755,7 @@ async def approve_submission(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if user.tasks_completed == 1 and user.referrer_id: # First task completed triggers successful referral
             referrer = db_session.query(User).filter(User.id == user.referrer_id).first()
             if referrer: referrer.balance += INVITE_REWARD; referrer.successful_referrals += 1
-            await ptb_app.bot.send_message(user.referrer_id, f"🎉 Your referred ally {user.id} completed their first task! You earned ₱{INVITE_REWARD:.2f}!")
+            await ptb_app.bot.send_message(user.referrer_id, f"🎉 Your referred ally {user.first_name} ({user.id}) completed their first task! You earned ₱{INVITE_REWARD:.2f}!")
     
     db_session.commit()
     await query.edit_message_caption(caption=f"{query.message.caption.text}\n\n**Status: APPROVED**", parse_mode='Markdown')
@@ -588,7 +784,7 @@ async def approve_withdrawal(update: Update, context: ContextTypes.DEFAULT_TYPE)
     wd_id = int(query.data.split("_")[2]); withdrawal = db_session.query(Withdrawal).filter(Withdrawal.id == wd_id).first()
     if not withdrawal or withdrawal.status != "pending": await query.edit_message_text("Request already processed."); return
     withdrawal.status = "approved"; db_session.commit(); await query.edit_message_text(f"✅ Request #{wd_id} approved.")
-    await ptb_app.bot.send_message(chat_id=withdrawal.user_id, text=f"🎉 Good news! Your withdrawal of ₱{withdrawal.amount:.2f} has been approved and sent.")
+    await ptb_app.bot.send_message(chat_id=withdrawal.user_id, text=f"🎉 Good news! Your withdrawal of ₱{withdrawal.amount:.2f} (Fee: ₱{withdrawal.fee:.2f}) has been approved and sent!")
 
 async def reject_withdrawal_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['withdrawal_id_to_reject'] = int(update.callback_query.data.split("_")[3])
@@ -598,21 +794,25 @@ async def get_withdrawal_rejection_reason(update: Update, context: ContextTypes.
     wd_id = context.user_data['withdrawal_id_to_reject']; withdrawal = db_session.query(Withdrawal).filter(Withdrawal.id == wd_id).first()
     if not withdrawal or withdrawal.status != 'pending': await update.message.reply_text("Already processed."); return ConversationHandler.END
     reason = "No reason provided." if update.message.text.lower() == '/skip' else update.message.text
-    user = db_session.query(User).filter(User.id == withdrawal.user_id).first(); user.balance += withdrawal.amount; withdrawal.status = "rejected"; db_session.commit()
+    user = db_session.query(User).filter(User.id == withdrawal.user_id).first(); user.balance += withdrawal.amount + withdrawal.fee; withdrawal.status = "rejected"; db_session.commit() # Refund amount + fee
     await update.message.reply_text(f"❌ Request #{wd_id} has been rejected.")
-    await ptb_app.bot.send_message(chat_id=user.id, text=f"⚠️ Your withdrawal of ₱{withdrawal.amount:.2f} was rejected and the amount returned to your balance.\n\n**Admin's Remark:** {reason}", parse_mode='Markdown')
+    await ptb_app.bot.send_message(chat_id=user.id, text=f"⚠️ Your withdrawal of ₱{withdrawal.amount:.2f} (Fee: ₱{withdrawal.fee:.2f}) was rejected and the total amount returned to your balance.\n\n**Admin's Remark:** {reason}", parse_mode='Markdown')
     return ConversationHandler.END
 
 # --- Maintenance Mode Toggle ---
 async def maintenance_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     maintenance_info = db_session.query(SystemInfo).filter(SystemInfo.key == 'withdrawal_maintenance').first()
-    current_status_text = "ENABLED ✅" if maintenance_info and maintenance_info.value == "true" else "DISABLED ❌"
-    toggle_button_text = f"Turn {'OFF' if current_status_text.startswith('ENABLED') else 'ON'}"
-    keyboard = [[InlineKeyboardButton(toggle_button_text, callback_data="toggle_maintenance")]]
-    await query.message.edit_text(f"Withdrawal Maintenance is currently {current_status_text}", reply_markup=InlineKeyboardMarkup(keyboard))
+    if not maintenance_info: maintenance_info = SystemInfo(key='withdrawal_maintenance', value='false')
+
+    new_status = "true" if maintenance_info.value == "false" else "false"
+    maintenance_info.value = new_status
+    db_session.add(maintenance_info); db_session.commit()
+
+    status_text = "ENABLED ✅" if new_status == "true" else "DISABLED ❌"
+    await query.message.edit_text(f"Withdrawal Maintenance is now {status_text}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"Toggle {'OFF' if new_status=='true' else 'ON'}", callback_data="toggle_maintenance")]]))
     
-async def toggle_maintenance_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def toggle_maintenance_mode(update: Update, context: ContextTypes.DEFAULT_TYPE): # Handles the toggle button press
     query = update.callback_query; await query.answer()
     maintenance_info = db_session.query(SystemInfo).filter(SystemInfo.key == 'withdrawal_maintenance').first()
     if not maintenance_info: maintenance_info = SystemInfo(key='withdrawal_maintenance', value='false')
@@ -642,6 +842,29 @@ async def send_warn_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"User {user_id} not found.")
     return ConversationHandler.END
 
+# --- Manage Games (Admin) ---
+async def manage_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    pending_rooms = db_session.query(GameRoom).filter(GameRoom.status == 'pending').all()
+    active_rooms = db_session.query(GameRoom).filter(GameRoom.status == 'active').all()
+    
+    msg = "**🎮 Game Room Status**\n\n"
+    if pending_rooms:
+        msg += "Pending Rooms:\n"
+        for r in pending_rooms:
+            creator_user = db_session.query(User).filter(User.id == r.creator_id).first()
+            msg += f"- ID `{r.id}`: ₱{r.bet_amount:.2f} by {creator_user.first_name if creator_user else 'Unknown'} ({r.creator_id})\n"
+    else: msg += "No pending rooms.\n"
+
+    if active_rooms:
+        msg += "\nActive Games:\n"
+        for r in active_rooms:
+            creator_user = db_session.query(User).filter(User.id == r.creator_id).first()
+            opponent_user = db_session.query(User).filter(User.id == r.opponent_id).first()
+            msg += f"- ID `{r.id}`: ₱{r.bet_amount:.2f} ({creator_user.first_name if creator_user else 'Unknown'} vs {opponent_user.first_name if opponent_user else 'Unknown'})\n"
+    else: msg += "No active games.\n"
+    
+    await query.message.edit_text(msg, parse_mode='Markdown')
 
 # --- Add Handlers to the PTB Application ---
 ptb_app.add_handler(CommandHandler("start", start_command))
@@ -662,10 +885,8 @@ ptb_app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(warn_
 # Callback Query Handlers (non-conversation specific)
 ptb_app.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
 ptb_app.add_handler(CallbackQueryHandler(manage_tasks, pattern="^admin_manage_tasks$"))
-ptb_app.add_handler(CallbackQueryHandler(remove_task_list, pattern="^remove_task_list$"))
 ptb_app.add_handler(CallbackQueryHandler(delete_task_callback, pattern=r"^delete_task_\d+$"))
 ptb_app.add_handler(CallbackQueryHandler(manage_codes, pattern="^admin_manage_codes$"))
-ptb_app.add_handler(CallbackQueryHandler(remove_code_list, pattern="^remove_code_list$"))
 ptb_app.add_handler(CallbackQueryHandler(delete_code_callback, pattern=r"^delete_code_\d+$"))
 ptb_app.add_handler(CallbackQueryHandler(user_mgt_action_callback, pattern=r"^user_mgt_(ban|unban|restrict)$"))
 ptb_app.add_handler(CallbackQueryHandler(review_submissions, pattern="^admin_pending_submissions$"))
@@ -673,9 +894,10 @@ ptb_app.add_handler(CallbackQueryHandler(approve_submission, pattern=r"^approve_
 ptb_app.add_handler(CallbackQueryHandler(approve_withdrawal, pattern=r"^approve_wd_\d+$"))
 ptb_app.add_handler(CallbackQueryHandler(maintenance_start, pattern="^admin_maintenance$"))
 ptb_app.add_handler(CallbackQueryHandler(toggle_maintenance_mode, pattern="^toggle_maintenance$"))
+ptb_app.add_handler(CallbackQueryHandler(manage_games, pattern="^admin_manage_games$"))
 
 
 # --- Main Entry ---
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)```
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)

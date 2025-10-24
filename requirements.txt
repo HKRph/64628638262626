@@ -3,3 +3,4 @@ sqlalchemy
 fastapi
 uvicorn
 python-dotenv
+websockets
