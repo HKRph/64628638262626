@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = "8486136204:AAFZkkxVFlBK1S5_RzrOlZ4ZZ6cDBcBjqVY"
 BOT_USERNAME = "GTaskPHBot"
 ADMIN_CHAT_ID = 7331257920
-MINI_APP_URL = "https://gtask-fronted.vercel.app" # IMPORTANT: Make sure this is your Vercel URL
+MINI_APP_URL = "https://your-frontend-url.vercel.app" # IMPORTANT: Make sure this is your Vercel URL
 INVITE_REWARD = 77.0
 MIN_WITHDRAWAL = 500.0
 
@@ -50,7 +50,6 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 # --- API Endpoints ---
 @app.get("/")
 async def health_check(): return {"status": "ok", "bot": BOT_USERNAME}
-
 @app.post("/get_initial_data")
 async def get_initial_data(request: Request):
     try:
@@ -63,7 +62,6 @@ async def get_initial_data(request: Request):
         announcement = db_session.query(SystemInfo).filter(SystemInfo.key == 'announcement').first()
         return { "balance": user.balance, "referral_count": user.referral_count, "successful_referrals": user.successful_referrals, "announcement": announcement.value if announcement else "Welcome! No new announcements.", "tasks": [{"id": t.id, "description": t.description, "link": t.link, "reward": t.reward} for t in tasks], "withdrawals": [{"id": w.id, "amount": w.amount, "method": w.method, "status": w.status} for w in withdrawals] }
     except Exception as e: logger.error(f"Error in get_initial_data: {e}"); return {"error": "Internal server error"}
-
 @app.post("/submit_task_proof")
 async def submit_task_proof(request: Request):
     try:
@@ -73,7 +71,6 @@ async def submit_task_proof(request: Request):
         await ptb_app.bot.send_message(user_id, "✅ Your proof has been submitted for admin review!")
         return {"status": "success"}
     except Exception as e: logger.error(f"Error in submit_task_proof: {e}"); return {"error": "Internal server error"}
-
 @app.post("/redeem_code")
 async def redeem_code(request: Request):
     try:
@@ -84,8 +81,6 @@ async def redeem_code(request: Request):
             return {"status": "success", "amount_rewarded": code.reward}
         else: return {"status": "error", "message": "Invalid or expired code."}
     except Exception as e: logger.error(f"Error in redeem_code: {e}"); return {"error": "Internal server error"}
-
-# --- Telegram Bot Handlers ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if context.args:
@@ -101,14 +96,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = (f"🚀 **Greetings, {user.first_name}!**\n\nWelcome to **{BOT_USERNAME}**, your portal to earning real rewards. Embark on quests (tasks), recruit allies (referrals), and claim your treasure.\n\nYour adventure begins now. Launch the dashboard to get started!")
     keyboard = [[InlineKeyboardButton("📱 Launch Dashboard", web_app=WebAppInfo(url=MINI_APP_URL))]]
     await update.message.reply_text(caption, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_CHAT_ID: return
     keyboard = [ [InlineKeyboardButton("📊 User Stats", callback_data="admin_stats"), InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")], [InlineKeyboardButton("📝 Manage Tasks", callback_data="admin_manage_tasks")], [InlineKeyboardButton("📜 Set Announcement", callback_data="admin_set_announcement")], [InlineKeyboardButton("🔑 Manage Codes", callback_data="admin_manage_codes")], [InlineKeyboardButton("🧐 Review Submissions", callback_data="admin_pending_submissions")] ]
     await update.message.reply_text("👑 **Ultimate Admin Dashboard**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE): query = update.callback_query; await query.answer(); total_users = db_session.query(User).count(); total_balance = sum(u.balance for u in db_session.query(User).all()); pending_withdrawals = db_session.query(Withdrawal).filter(Withdrawal.status == 'pending').count(); await query.message.reply_text(f"**Bot Stats:**\n\n- Users: {total_users}\n- Balance in Circulation: ₱{total_balance:.2f}\n- Pending Withdrawals: {pending_withdrawals}", parse_mode='Markdown')
-
-# --- Admin Conversations ---
 async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE): await update.callback_query.answer(); await update.callback_query.message.reply_text("Send the message to broadcast."); return BROADCAST_MESSAGE
 async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = db_session.query(User).all()
@@ -134,37 +126,26 @@ async def review_submissions(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query; await query.answer()
     submission = db_session.query(TaskSubmission).filter(TaskSubmission.status == 'pending').first()
     if not submission: await query.message.edit_text("No pending submissions."); return
-    user = db_session.query(User).filter(User.id == submission.user_id).first()
-    task = db_session.query(Task).filter(Task.id == submission.task_id).first()
+    user = db_session.query(User).filter(User.id == submission.user_id).first(); task = db_session.query(Task).filter(Task.id == submission.task_id).first()
     caption = f"**Submission Review**\n\n- User: {user.id}\n- Task: {task.description}\n- Note: {submission.text_proof}"
     keyboard = [[InlineKeyboardButton("Approve ✅", callback_data=f"approve_sub_{submission.id}"), InlineKeyboardButton("Reject ❌", callback_data=f"reject_sub_{submission.id}")]]
-    photo_data = base64.b64decode(submission.photo_proof_base64.split(',')[1])
-    await query.message.reply_photo(photo=BytesIO(photo_data), caption=caption, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    photo_data = base64.b64decode(submission.photo_proof_base64.split(',')[1]); await query.message.reply_photo(photo=BytesIO(photo_data), caption=caption, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 async def approve_submission(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     sub_id = int(query.data.split("_")[2]); submission = db_session.query(TaskSubmission).filter(TaskSubmission.id == sub_id).first()
     if not submission or submission.status != 'pending': await query.edit_message_caption("Already processed."); return
-    submission.status = 'approved'
-    user = db_session.query(User).filter(User.id == submission.user_id).first()
-    task = db_session.query(Task).filter(Task.id == submission.task_id).first()
-    user.balance += task.reward
+    submission.status = 'approved'; user = db_session.query(User).filter(User.id == submission.user_id).first(); task = db_session.query(Task).filter(Task.id == submission.task_id).first(); user.balance += task.reward
     if user.tasks_completed == 0 and user.referrer_id:
         referrer = db_session.query(User).filter(User.id == user.referrer_id).first()
         if referrer: referrer.balance += INVITE_REWARD; referrer.successful_referrals += 1
-    user.tasks_completed += 1
-    db_session.commit()
-    await query.edit_message_caption(caption=f"{query.message.caption.text}\n\n**Status: APPROVED**", parse_mode='Markdown')
-    await ptb_app.bot.send_message(chat_id=user.id, text=f"🎉 Your submission for '{task.description}' was approved! You earned ₱{task.reward:.2f}.")
+    user.tasks_completed += 1; db_session.commit()
+    await query.edit_message_caption(caption=f"{query.message.caption.text}\n\n**Status: APPROVED**", parse_mode='Markdown'); await ptb_app.bot.send_message(chat_id=user.id, text=f"🎉 Your submission for '{task.description}' was approved! You earned ₱{task.reward:.2f}.")
 async def reject_submission(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     sub_id = int(query.data.split("_")[2]); submission = db_session.query(TaskSubmission).filter(TaskSubmission.id == sub_id).first()
     if not submission or submission.status != 'pending': await query.edit_message_caption("Already processed."); return
-    submission.status = 'rejected'; db_session.commit()
-    await query.edit_message_caption(caption=f"{query.message.caption.text}\n\n**Status: REJECTED**", parse_mode='Markdown')
-    task = db_session.query(Task).filter(Task.id == submission.task_id).first()
-    await ptb_app.bot.send_message(chat_id=submission.user_id, text=f"⚠️ Your submission for '{task.description}' was rejected.")
-
-# --- Add Handlers to the PTB Application ---
+    submission.status = 'rejected'; db_session.commit(); await query.edit_message_caption(caption=f"{query.message.caption.text}\n\n**Status: REJECTED**", parse_mode='Markdown')
+    task = db_session.query(Task).filter(Task.id == submission.task_id).first(); await ptb_app.bot.send_message(chat_id=submission.user_id, text=f"⚠️ Your submission for '{task.description}' was rejected.")
 ptb_app.add_handler(CommandHandler("start", start_command))
 ptb_app.add_handler(CommandHandler("admin", admin_command))
 add_task_conv = ConversationHandler(entry_points=[CallbackQueryHandler(add_task_start, pattern="^add_task_start$")], states={TASK_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_task_description)], TASK_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_task_link)], TASK_REWARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_task_reward)]}, fallbacks=[], per_user=True)
@@ -176,8 +157,6 @@ ptb_app.add_handler(CallbackQueryHandler(manage_tasks, pattern="^admin_manage_ta
 ptb_app.add_handler(CallbackQueryHandler(review_submissions, pattern="^admin_pending_submissions$"))
 ptb_app.add_handler(CallbackQueryHandler(approve_submission, pattern=r"^approve_sub_\d+$"))
 ptb_app.add_handler(CallbackQueryHandler(reject_submission, pattern=r"^reject_sub_\d+$"))
-# ... (add other handlers like remove_task, manage_codes here)
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
