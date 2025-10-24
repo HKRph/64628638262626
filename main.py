@@ -14,26 +14,32 @@ from sqlalchemy import create_engine, Column, Integer, BigInteger, String, Float
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 # --- Configuration ---
-logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 BOT_TOKEN = "8486136204:AAFZkkxVFlBK1S5_RzrOlZ4ZZ6cDBcBjqVY"
 BOT_USERNAME = "GTaskPHBot"
 ADMIN_CHAT_ID = 7331257920 # IMPORTANT: Replace with your actual Admin Telegram User ID
-MINI_APP_URL = "https://gtask-fronted.vercel.app/" # IMPORTANT: Your Vercel Frontend URL
+MINI_APP_URL = "https://gtask-fronted.vercel.app/" # YOUR FRONTEND URL
 INVITE_REWARD = 77.0 # Reward for a successful referral (when referred user completes first task)
 MIN_WITHDRAWAL = 300.0 # Minimum amount a user can withdraw
 MAX_WITHDRAWAL = 30000.0 # Maximum amount a user can withdraw
+WITHDRAWAL_FEE_PERCENT = 0.03 # 3% fee
 DAILY_BONUS = 10.0 # Amount for daily login bonus
 DAILY_BONUS_INVITE_REQ = 2 # Number of new invites required since last claim for daily bonus
 TASK_MILESTONES = {"10_tasks": 50.0, "20_tasks": 150.0, "30_tasks": 400.0} # Bonus rewards for completing tasks
+GIFT_TICKET_PRICE = 77.0
+GIFT_MIN_AMOUNT = 300.0
+GIFT_MAX_AMOUNT = 80000.0
+GIFT_FEE_PERCENT = 0.05 # 5% fee
 
 # --- Database Setup ---
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 Base = declarative_base()
 class User(Base):
     __tablename__ = "users"
     id = Column(BigInteger, primary_key=True, autoincrement=False)
     balance = Column(Float, default=0.0)
+    gift_tickets = Column(Integer, default=0)
     referral_count = Column(Integer, default=0) # Total referred users
     successful_referrals = Column(Integer, default=0) # Referred users who completed at least one task
     tasks_completed = Column(Integer, default=0) # Total tasks completed by user
@@ -67,6 +73,7 @@ class Withdrawal(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(BigInteger)
     amount = Column(Float)
+    fee = Column(Float, default=0.0)
     method = Column(String)
     details = Column(String)
     status = Column(String, default="pending") # pending, approved, rejected
@@ -87,7 +94,7 @@ class SystemInfo(Base):
 engine = create_engine("sqlite:///gtask_data.db") # Using a specific DB name for clarity
 Base.metadata.create_all(engine); Session = sessionmaker(bind=engine); db_session = Session()
 
-# --- Conversation States (Explicitly defined for clarity and reliability) ---
+# --- Conversation States (FIXED AND EXPLICITLY DEFINED) ---
 STATE_TASK_DESC = 0
 STATE_TASK_LINK = 1
 STATE_TASK_REWARD = 2
@@ -107,30 +114,9 @@ STATE_DELETE_TASK = 15
 STATE_DELETE_CODE = 16
 STATE_WARN_USER_ID = 17
 STATE_WARN_REASON = 18
-STATE_WITHDRAWAL_MAINTENANCE = 19
-
 
 # Assigning to readable names for use in ConversationHandler
-TASK_DESC = STATE_TASK_DESC
-TASK_LINK = STATE_TASK_LINK
-TASK_REWARD = STATE_TASK_REWARD
-REJECT_REASON_WD = STATE_REJECT_WD_REASON
-BROADCAST_MESSAGE = STATE_BROADCAST_MESSAGE
-ANNOUNCEMENT_TEXT = STATE_ANNOUNCEMENT_TEXT
-NEW_CODE_CODE = STATE_NEW_CODE_CODE
-NEW_CODE_REWARD = STATE_NEW_CODE_REWARD
-NEW_CODE_USES = STATE_NEW_CODE_USES
-USER_MGT_ID = STATE_USER_MGT_ID
-USER_MGT_ACTION = STATE_USER_MGT_ACTION
-USER_MGT_DURATION = STATE_USER_MGT_DURATION
-RAIN_AMOUNT = STATE_RAIN_AMOUNT
-RAIN_USERS = STATE_RAIN_USERS
-SUBMIT_TASK_REJECT_REASON = STATE_REJECT_SUB_REASON
-DELETE_TASK = STATE_DELETE_TASK
-DELETE_CODE = STATE_DELETE_CODE
-WARN_USER_ID = STATE_WARN_USER_ID
-WARN_REASON = STATE_WARN_REASON
-WITHDRAWAL_MAINTENANCE = STATE_WITHDRAWAL_MAINTENANCE
+TASK_DESC, TASK_LINK, TASK_REWARD, REJECT_REASON_WD, BROADCAST_MESSAGE, ANNOUNCEMENT_TEXT, NEW_CODE_CODE, NEW_CODE_REWARD, NEW_CODE_USES, USER_MGT_ID, USER_MGT_ACTION, USER_MGT_DURATION, RAIN_AMOUNT, RAIN_USERS, SUBMIT_TASK_REJECT_REASON, DELETE_TASK, DELETE_CODE, WARN_USER_ID, WARN_REASON = range(19)
 
 
 # --- Bot & API Lifespan ---
@@ -169,7 +155,7 @@ async def get_initial_data(request: Request):
         user = db_session.query(User).filter(User.id == user_id).first()
         if not user: user = User(id=user_id); db_session.add(user); db_session.commit()
         
-        # Check user status
+        # Check user status for Mini App access
         if user.status == 'banned': raise HTTPException(status_code=403, detail="You are permanently banned.")
         if user.status == 'restricted' and user.status_until and user.status_until > date.today():
             raise HTTPException(status_code=403, detail=f"You are restricted until {user.status_until.strftime('%b %d')}.")
@@ -189,6 +175,7 @@ async def get_initial_data(request: Request):
         
         return {
             "balance": user.balance,
+            "gift_tickets": user.gift_tickets,
             "referral_count": user.referral_count,
             "successful_referrals": user.successful_referrals,
             "tasks_completed": user.tasks_completed,
@@ -197,11 +184,16 @@ async def get_initial_data(request: Request):
             "daily_bonus_req": DAILY_BONUS_INVITE_REQ,
             "announcement": announcement.value if announcement else "Welcome! No new announcements.",
             "tasks": [{"id": t.id, "description": t.description, "link": t.link, "reward": t.reward} for t in available_tasks],
-            "withdrawals": [{"id": w.id, "amount": w.amount, "method": w.method, "status": w.status, "date": w.created_at.strftime('%Y-%m-%d')} for w in withdrawals],
+            "withdrawals": [{"id": w.id, "amount": w.amount, "fee": w.fee, "status": w.status, "date": w.created_at.strftime('%Y-%m-%d')} for w in withdrawals],
             "claimed_milestones": json.loads(user.claimed_milestones) if user.claimed_milestones else {},
             "min_withdrawal": MIN_WITHDRAWAL,
             "max_withdrawal": MAX_WITHDRAWAL,
-            "withdrawal_maintenance": withdrawal_maintenance.value == "true" if withdrawal_maintenance else False
+            "withdrawal_fee_percent": WITHDRAWAL_FEE_PERCENT,
+            "withdrawal_maintenance": withdrawal_maintenance.value == "true" if withdrawal_maintenance else False,
+            "gift_ticket_price": GIFT_TICKET_PRICE,
+            "gift_min_amount": GIFT_MIN_AMOUNT,
+            "gift_max_amount": GIFT_MAX_AMOUNT,
+            "gift_fee_percent": GIFT_FEE_PERCENT
         }
     except HTTPException as he:
         logger.warning(f"API Error for user {user_id}: {he.detail}")
@@ -218,7 +210,6 @@ async def submit_task_proof(request: Request):
         user_db = db_session.query(User).filter(User.id == user_id).first()
         if not user_db or user_db.status != 'active': raise HTTPException(status_code=403, detail="Account not active.")
         
-        # Prevent re-submission of already completed tasks
         completed_task_ids_list = json.loads(user_db.completed_task_ids) if user_db.completed_task_ids else []
         if task_id in completed_task_ids_list:
             raise HTTPException(status_code=400, detail="Task already completed.")
@@ -277,7 +268,7 @@ async def claim_daily_bonus(request: Request):
         else:
             raise HTTPException(status_code=400, detail="Daily bonus already claimed or not yet available.")
     except HTTPException as he: raise he
-    except Exception as e: logger.error(f"Error in claim_daily_bonus: {e}", exc_info=True); raise HTTPException(status_code=500, detail="Internal server error")
+    except Exception as e: logger.error(f"API Error in claim_daily_bonus: {e}", exc_info=True); raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/submit_withdrawal")
 async def submit_withdrawal(request: Request):
@@ -292,19 +283,63 @@ async def submit_withdrawal(request: Request):
         if not user or user.status != 'active': raise HTTPException(status_code=403, detail="Account not active.")
         if not (MIN_WITHDRAWAL <= amount <= MAX_WITHDRAWAL):
             raise HTTPException(status_code=400, detail=f"Amount must be between ₱{MIN_WITHDRAWAL:.2f} and ₱{MAX_WITHDRAWAL:.2f}.")
-        if user.balance < amount:
-            raise HTTPException(status_code=400, detail="Insufficient balance.")
+        
+        fee = amount * WITHDRAWAL_FEE_PERCENT
+        total_deduction = amount + fee
+
+        if user.balance < total_deduction:
+            raise HTTPException(status_code=400, detail="Insufficient balance to cover withdrawal amount and fee.")
             
-        new_withdrawal = Withdrawal(user_id=user.id, amount=amount, method=method, details=details, created_at=date.today())
-        db_session.add(new_withdrawal); user.balance -= amount; db_session.commit()
-        await ptb_app.bot.send_message(user_id, "✅ Your withdrawal request has been submitted! Our team will review it shortly.")
-        admin_message = f"**New Withdrawal Request**\n\n- User ID: `{user.id}`\n- Amount: `₱{amount:.2f}`\n- Method: `{method}`\n- Details: `{details}`\n\n**Action: /admin**"
+        new_withdrawal = Withdrawal(user_id=user.id, amount=amount, fee=fee, method=method, details=details, created_at=date.today())
+        db_session.add(new_withdrawal); user.balance -= total_deduction; db_session.commit()
+        await ptb_app.bot.send_message(user_id, f"✅ Your withdrawal request for ₱{amount:.2f} (Fee: ₱{fee:.2f}) has been submitted! Our team will review it shortly.")
+        admin_message = f"**New Withdrawal Request**\n\n- User ID: `{user.id}`\n- Amount: `₱{amount:.2f}`\n- Fee: `₱{fee:.2f}`\n- Method: `{method}`\n- Details: `{details}`\n\n**Action: /admin**"
         keyboard = [[InlineKeyboardButton("Approve ✅", callback_data=f"approve_wd_{new_withdrawal.id}"), InlineKeyboardButton("Reject ❌", callback_data=f"reject_wd_start_{new_withdrawal.id}")]]
         await ptb_app.bot.send_message(chat_id=ADMIN_CHAT_ID, text=admin_message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
         return {"status": "success"}
     except HTTPException as he: raise he
     except Exception as e: logger.error(f"Error in submit_withdrawal: {e}", exc_info=True); raise HTTPException(status_code=500, detail="Internal server error")
 
+@app.post("/buy_ticket")
+async def buy_ticket(request: Request):
+    try:
+        data = await request.json(); user_id = data.get('user_id')
+        user = db_session.query(User).filter(User.id == user_id).first()
+        if not user or user.status != 'active': raise HTTPException(status_code=403, detail="Account not active.")
+        if user.balance < GIFT_TICKET_PRICE: raise HTTPException(status_code=400, detail="Insufficient balance to buy a Gift Ticket.")
+        user.balance -= GIFT_TICKET_PRICE; user.gift_tickets += 2; db_session.commit()
+        await ptb_app.bot.send_message(user_id, f"🎉 You have successfully bought a Gift Ticket and received one for free! You now have {user.gift_tickets} tickets.")
+        return {"status": "success"}
+    except HTTPException as he: raise he
+    except Exception as e: logger.error(f"API Error in buy_ticket: {e}", exc_info=True); raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/gift_money")
+async def gift_money(request: Request):
+    try:
+        data = await request.json(); user_id = data.get('user_id'); recipient_id = int(data.get('recipient_id')); amount = float(data.get('amount'))
+        
+        sender = db_session.query(User).filter(User.id == user_id).first()
+        if not sender or sender.status != 'active': raise HTTPException(status_code=403, detail="Account not active.")
+        if sender.gift_tickets < 1: raise HTTPException(status_code=400, detail="You do not have any Gift Tickets.")
+        if not (GIFT_MIN_AMOUNT <= amount <= GIFT_MAX_AMOUNT): raise HTTPException(status_code=400, detail=f"Amount must be between ₱{GIFT_MIN_AMOUNT:.2f} and ₱{GIFT_MAX_AMOUNT:.2f}.")
+        
+        fee = amount * GIFT_FEE_PERCENT
+        total_deduction = amount + fee
+        if sender.balance < total_deduction: raise HTTPException(status_code=400, detail="Insufficient balance to cover gift amount and fee.")
+
+        recipient = db_session.query(User).filter(User.id == recipient_id).first()
+        if not recipient: raise HTTPException(status_code=404, detail="Recipient user not found.")
+        if recipient.status != 'active': raise HTTPException(status_code=400, detail="Recipient account is not active.")
+
+        sender.balance -= total_deduction; sender.gift_tickets -= 1
+        recipient.balance += amount
+        db_session.commit()
+
+        await ptb_app.bot.send_message(user_id, f"✅ You have successfully gifted ₱{amount:.2f} to user {recipient_id}. A fee of ₱{fee:.2f} was applied.")
+        await ptb_app.bot.send_message(recipient_id, f"🎉 You have received a gift of ₱{amount:.2f} from user {user_id}!")
+        return {"status": "success"}
+    except HTTPException as he: raise he
+    except Exception as e: logger.error(f"API Error in gift_money: {e}", exc_info=True); raise HTTPException(status_code=500, detail="Internal server error")
 
 # --- Telegram Handlers ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -408,11 +443,11 @@ async def remove_task_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer(); tasks = db_session.query(Task).all()
     if not tasks: await query.message.edit_text("No tasks to remove."); return
     keyboard = [[InlineKeyboardButton(f"❌ {task.description[:40]} (₱{task.reward:.2f})", callback_data=f"delete_task_{task.id}")] for task in tasks]
-    await query.message.edit_text("Select a task to remove:", reply_markup=InlineKeyboardMarkup(keyboard)); return STATE_DELETE_TASK
+    await query.message.edit_text("Select a task to remove:", reply_markup=InlineKeyboardMarkup(keyboard));
 async def delete_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; task_id = int(query.data.split("_")[2]); task = db_session.query(Task).filter(Task.id == task_id).first()
-    if task: db_session.delete(task); db_session.commit(); await query.answer("Task removed!", show_alert=True); await manage_tasks(update, context)
-    else: await query.answer("Task not found.", show_alert=True); return ConversationHandler.END
+    if task: db_session.delete(task); db_session.commit(); await query.answer("Task removed!", show_alert=True); await remove_task_list(update, context)
+    else: await query.answer("Task not found.", show_alert=True)
 
 # --- Manage Codes ---
 async def manage_codes(update: Update, context: ContextTypes.DEFAULT_TYPE): query = update.callback_query; await query.answer(); keyboard = [[InlineKeyboardButton("➕ Add New Code", callback_data="add_code_start")], [InlineKeyboardButton("🗑️ Remove Code", callback_data="remove_code_list")]]; await query.message.edit_text("Manage redeem codes:", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -426,17 +461,17 @@ async def get_new_code_uses(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uses = int(update.message.text)
         code = RedeemCode(code=context.user_data['new_code_code'], reward=context.user_data['new_code_reward'], uses_left=uses)
         db_session.add(code); db_session.commit(); await update.message.reply_text("✅ Code added!"); return ConversationHandler.END
-    except ValueError: await update.message.reply_text("Invalid uses."); return ConversationHandler.END
+    except ValueError: await update.message.reply_text("Invalid uses."); return NEW_CODE_USES
 
 async def remove_code_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer(); codes = db_session.query(RedeemCode).all()
     if not codes: await query.message.edit_text("No codes to remove."); return
     keyboard = [[InlineKeyboardButton(f"❌ {code.code} (₱{code.reward:.2f}, uses: {code.uses_left})", callback_data=f"delete_code_{code.id}")] for code in codes]
-    await query.message.edit_text("Select a code to remove:", reply_markup=InlineKeyboardMarkup(keyboard)); return STATE_DELETE_CODE
+    await query.message.edit_text("Select a code to remove:", reply_markup=InlineKeyboardMarkup(keyboard));
 async def delete_code_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; code_id = int(query.data.split("_")[2]); code = db_session.query(RedeemCode).filter(RedeemCode.id == code_id).first()
-    if code: db_session.delete(code); db_session.commit(); await query.answer("Code removed!", show_alert=True); await manage_codes(update, context)
-    else: await query.answer("Code not found.", show_alert=True); return ConversationHandler.END
+    if code: db_session.delete(code); db_session.commit(); await query.answer("Code removed!", show_alert=True); await remove_code_list(update, context)
+    else: await query.answer("Code not found.", show_alert=True)
 
 # --- User Management ---
 async def user_mgt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -475,16 +510,8 @@ async def rain_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def rain_users_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: num_users = int(update.message.text); amount = context.user_data['rain_amount']
     except ValueError: await update.message.reply_text("Invalid number."); return RAIN_USERS
-    
     eligible_users = db_session.query(User).filter(User.status == 'active').all()
     if len(eligible_users) < num_users: await update.message.reply_text(f"Only {len(eligible_users)} eligible users found."); return ConversationHandler.END
-    
-    # Deduct from admin balance if implemented
-    admin_user = db_session.query(User).filter(User.id == ADMIN_CHAT_ID).first()
-    if admin_user and admin_user.balance < amount:
-        await update.message.reply_text("Admin does not have sufficient balance for this Rain Prize."); return ConversationHandler.END
-    if admin_user: admin_user.balance -= amount
-    
     winners = random.sample(eligible_users, num_users)
     prize_per_user = amount / num_users
     for user in winners:
@@ -513,7 +540,6 @@ async def approve_submission(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user = db_session.query(User).filter(User.id == submission.user_id).first()
     task = db_session.query(Task).filter(Task.id == submission.task_id).first()
     
-    # Check if task was already completed (safety check)
     completed_task_ids_list = json.loads(user.completed_task_ids) if user.completed_task_ids else []
     if task.id not in completed_task_ids_list:
         user.balance += task.reward
@@ -521,7 +547,6 @@ async def approve_submission(update: Update, context: ContextTypes.DEFAULT_TYPE)
         completed_task_ids_list.append(task.id)
         user.completed_task_ids = json.dumps(completed_task_ids_list)
 
-        # Task Milestone Rewards
         claimed_milestones = json.loads(user.claimed_milestones) if user.claimed_milestones else {}
         for milestone_str, reward_amount in TASK_MILESTONES.items():
             milestone = int(milestone_str.split('_')[0])
@@ -563,7 +588,7 @@ async def approve_withdrawal(update: Update, context: ContextTypes.DEFAULT_TYPE)
     wd_id = int(query.data.split("_")[2]); withdrawal = db_session.query(Withdrawal).filter(Withdrawal.id == wd_id).first()
     if not withdrawal or withdrawal.status != "pending": await query.edit_message_text("Request already processed."); return
     withdrawal.status = "approved"; db_session.commit(); await query.edit_message_text(f"✅ Request #{wd_id} approved.")
-    await ptb_app.bot.send_message(chat_id=withdrawal.user_id, text=f"🎉 Good news! Your withdrawal of ₱{withdrawal.amount:.2f} has been approved and sent!")
+    await ptb_app.bot.send_message(chat_id=withdrawal.user_id, text=f"🎉 Good news! Your withdrawal of ₱{withdrawal.amount:.2f} has been approved and sent.")
 
 async def reject_withdrawal_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['withdrawal_id_to_reject'] = int(update.callback_query.data.split("_")[3])
@@ -579,6 +604,14 @@ async def get_withdrawal_rejection_reason(update: Update, context: ContextTypes.
     return ConversationHandler.END
 
 # --- Maintenance Mode Toggle ---
+async def maintenance_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    maintenance_info = db_session.query(SystemInfo).filter(SystemInfo.key == 'withdrawal_maintenance').first()
+    current_status_text = "ENABLED ✅" if maintenance_info and maintenance_info.value == "true" else "DISABLED ❌"
+    toggle_button_text = f"Turn {'OFF' if current_status_text.startswith('ENABLED') else 'ON'}"
+    keyboard = [[InlineKeyboardButton(toggle_button_text, callback_data="toggle_maintenance")]]
+    await query.message.edit_text(f"Withdrawal Maintenance is currently {current_status_text}", reply_markup=InlineKeyboardMarkup(keyboard))
+    
 async def toggle_maintenance_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     maintenance_info = db_session.query(SystemInfo).filter(SystemInfo.key == 'withdrawal_maintenance').first()
@@ -629,17 +662,20 @@ ptb_app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(warn_
 # Callback Query Handlers (non-conversation specific)
 ptb_app.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
 ptb_app.add_handler(CallbackQueryHandler(manage_tasks, pattern="^admin_manage_tasks$"))
+ptb_app.add_handler(CallbackQueryHandler(remove_task_list, pattern="^remove_task_list$"))
 ptb_app.add_handler(CallbackQueryHandler(delete_task_callback, pattern=r"^delete_task_\d+$"))
 ptb_app.add_handler(CallbackQueryHandler(manage_codes, pattern="^admin_manage_codes$"))
+ptb_app.add_handler(CallbackQueryHandler(remove_code_list, pattern="^remove_code_list$"))
 ptb_app.add_handler(CallbackQueryHandler(delete_code_callback, pattern=r"^delete_code_\d+$"))
 ptb_app.add_handler(CallbackQueryHandler(user_mgt_action_callback, pattern=r"^user_mgt_(ban|unban|restrict)$"))
 ptb_app.add_handler(CallbackQueryHandler(review_submissions, pattern="^admin_pending_submissions$"))
 ptb_app.add_handler(CallbackQueryHandler(approve_submission, pattern=r"^approve_sub_\d+$"))
 ptb_app.add_handler(CallbackQueryHandler(approve_withdrawal, pattern=r"^approve_wd_\d+$"))
-ptb_app.add_handler(CallbackQueryHandler(toggle_maintenance_mode, pattern="^admin_maintenance$|^toggle_maintenance$"))
+ptb_app.add_handler(CallbackQueryHandler(maintenance_start, pattern="^admin_maintenance$"))
+ptb_app.add_handler(CallbackQueryHandler(toggle_maintenance_mode, pattern="^toggle_maintenance$"))
 
 
 # --- Main Entry ---
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)```
