@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = "8486136204:AAFZkkxVFlBK1S5_RzrOlZ4ZZ6cDBcBjqVY"
 BOT_USERNAME = "GTaskPHBot"
 ADMIN_CHAT_ID = 7331257920
-MINI_APP_URL = "https://gtask-fronted.vercel.app" # IMPORTANT: Make sure this is your Vercel URL
+MINI_APP_URL = "https://gtask-fronted.vercel.app/" # YOUR FRONTEND URL
 INVITE_REWARD = 77.0
 MIN_WITHDRAWAL = 500.0
 
@@ -146,6 +146,7 @@ async def reject_submission(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not submission or submission.status != 'pending': await query.edit_message_caption("Already processed."); return
     submission.status = 'rejected'; db_session.commit(); await query.edit_message_caption(caption=f"{query.message.caption.text}\n\n**Status: REJECTED**", parse_mode='Markdown')
     task = db_session.query(Task).filter(Task.id == submission.task_id).first(); await ptb_app.bot.send_message(chat_id=submission.user_id, text=f"⚠️ Your submission for '{task.description}' was rejected.")
+
 ptb_app.add_handler(CommandHandler("start", start_command))
 ptb_app.add_handler(CommandHandler("admin", admin_command))
 add_task_conv = ConversationHandler(entry_points=[CallbackQueryHandler(add_task_start, pattern="^add_task_start$")], states={TASK_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_task_description)], TASK_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_task_link)], TASK_REWARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_task_reward)]}, fallbacks=[], per_user=True)
@@ -157,6 +158,7 @@ ptb_app.add_handler(CallbackQueryHandler(manage_tasks, pattern="^admin_manage_ta
 ptb_app.add_handler(CallbackQueryHandler(review_submissions, pattern="^admin_pending_submissions$"))
 ptb_app.add_handler(CallbackQueryHandler(approve_submission, pattern=r"^approve_sub_\d+$"))
 ptb_app.add_handler(CallbackQueryHandler(reject_submission, pattern=r"^reject_sub_\d+$"))
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
