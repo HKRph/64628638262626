@@ -37,76 +37,14 @@ MIN_GAME_BET = 10.0 # Minimum bet for Jack and Poy
 
 # --- Database Setup ---
 Base = declarative_base()
-class User(Base):
-    __tablename__ = "users"
-    id = Column(BigInteger, primary_key=True, autoincrement=False)
-    balance = Column(Float, default=0.0)
-    gift_tickets = Column(Integer, default=0)
-    referral_count = Column(Integer, default=0) # Total referred users
-    successful_referrals = Column(Integer, default=0) # Referred users who completed at least one task
-    tasks_completed = Column(Integer, default=0) # Total tasks completed by user
-    completed_task_ids = Column(Text, default="[]") # JSON list of task IDs completed by this user
-    referrer_id = Column(BigInteger, ForeignKey("users.id"), nullable=True)
-    status = Column(String, default="active") # active, banned, restricted
-    status_until = Column(Date, nullable=True) # For temporary restrictions
-    last_login_date = Column(Date, nullable=True) # For daily bonus claim
-    daily_claim_invites = Column(Integer, default=0) # Invites since last daily claim
-    claimed_milestones = Column(Text, default="{}") # JSON string for task milestones claimed
-
-class Task(Base):
-    __tablename__ = "tasks"
-    id = Column(Integer, primary_key=True)
-    description = Column(String)
-    link = Column(String)
-    reward = Column(Float)
-
-class TaskSubmission(Base):
-    __tablename__ = "task_submissions"
-    id = Column(Integer, primary_key=True)
-    user_id = Column(BigInteger)
-    task_id = Column(Integer)
-    text_proof = Column(Text)
-    photo_proof_base64 = Column(Text)
-    status = Column(String, default="pending") # pending, approved, rejected
-    created_at = Column(Date, default=date.today())
-
-class Withdrawal(Base):
-    __tablename__ = "withdrawals"
-    id = Column(Integer, primary_key=True)
-    user_id = Column(BigInteger)
-    amount = Column(Float)
-    fee = Column(Float, default=0.0)
-    method = Column(String)
-    details = Column(String)
-    status = Column(String, default="pending") # pending, approved, rejected
-    created_at = Column(Date, default=date.today())
-
-class RedeemCode(Base):
-    __tablename__ = "redeem_codes"
-    id = Column(Integer, primary_key=True)
-    code = Column(String, unique=True)
-    reward = Column(Float)
-    uses_left = Column(Integer, default=1) # -1 for unlimited
-
-class SystemInfo(Base):
-    __tablename__ = "system_info"
-    key = Column(String, primary_key=True)
-    value = Column(String)
-
-class GameRoom(Base):
-    __tablename__ = "game_rooms"
-    id = Column(Integer, primary_key=True)
-    bet_amount = Column(Float)
-    creator_id = Column(BigInteger)
-    opponent_id = Column(BigInteger, nullable=True)
-    status = Column(String, default="pending") # pending, active, finished, cancelled
-    winner_id = Column(BigInteger, nullable=True) # ID of the winner, or -1 for draw
-    creator_move = Column(String, nullable=True) # rock, paper, scissors
-    opponent_move = Column(String, nullable=True) # rock, paper, scissors
-    created_at = Column(Date, default=date.today())
-
-engine = create_engine("sqlite:///gtask_data.db") # Using a specific DB name for clarity
-Base.metadata.create_all(engine); Session = sessionmaker(bind=engine); db_session = Session()
+class User(Base): __tablename__ = "users"; id = Column(BigInteger, primary_key=True, autoincrement=False); balance = Column(Float, default=0.0); gift_tickets = Column(Integer, default=0); referral_count = Column(Integer, default=0); successful_referrals = Column(Integer, default=0); tasks_completed = Column(Integer, default=0); completed_task_ids = Column(Text, default="[]"); referrer_id = Column(BigInteger, ForeignKey("users.id"), nullable=True); status = Column(String, default="active"); status_until = Column(Date, nullable=True); last_login_date = Column(Date, nullable=True); daily_claim_invites = Column(Integer, default=0); claimed_milestones = Column(Text, default="{}")
+class Task(Base): __tablename__ = "tasks"; id = Column(Integer, primary_key=True); description = Column(String); link = Column(String); reward = Column(Float)
+class TaskSubmission(Base): __tablename__ = "task_submissions"; id = Column(Integer, primary_key=True); user_id = Column(BigInteger); task_id = Column(Integer); text_proof = Column(Text); photo_proof_base64 = Column(Text); status = Column(String, default="pending"); created_at = Column(Date, default=date.today())
+class Withdrawal(Base): __tablename__ = "withdrawals"; id = Column(Integer, primary_key=True); user_id = Column(BigInteger); amount = Column(Float); fee = Column(Float, default=0.0); method = Column(String); details = Column(String); status = Column(String, default="pending"); created_at = Column(Date, default=date.today())
+class RedeemCode(Base): __tablename__ = "redeem_codes"; id = Column(Integer, primary_key=True); code = Column(String, unique=True); reward = Column(Float); uses_left = Column(Integer, default=1)
+class SystemInfo(Base): __tablename__ = "system_info"; key = Column(String, primary_key=True); value = Column(String)
+class GameRoom(Base): __tablename__ = "game_rooms"; id = Column(Integer, primary_key=True); bet_amount = Column(Float); creator_id = Column(BigInteger); opponent_id = Column(BigInteger, nullable=True); status = Column(String, default="pending"); winner_id = Column(BigInteger, nullable=True); creator_move = Column(String, nullable=True); opponent_move = Column(String, nullable=True); created_at = Column(Date, default=date.today())
+engine = create_engine("sqlite:///gtask_data.db"); Base.metadata.create_all(engine); Session = sessionmaker(bind=engine); db_session = Session()
 
 # --- Conversation States (DEFINED AT THE VERY TOP OF THE EXECUTABLE CODE) ---
 # These are explicitly assigned unique integers for clarity and reliability
@@ -875,8 +813,8 @@ async def force_end_game_command(update: Update, context: ContextTypes.DEFAULT_T
         creator = db_session.query(User).filter(User.id == room.creator_id).first()
         opponent = db_session.query(User).filter(User.id == room.opponent_id).first()
 
-        creator.balance += room.bet_amount # Refund original bets
-        opponent.balance += room.bet_amount
+        if creator: creator.balance += room.bet_amount # Refund original bets
+        if opponent: opponent.balance += room.bet_amount
         
         room.status = 'cancelled' # Set status to cancelled to prevent further moves
         db_session.commit()
@@ -924,4 +862,4 @@ ptb_app.add_handler(CommandHandler("force_end_game", force_end_game_command)) # 
 # --- Main Entry ---
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run(app, host="0.0.0.0", port=port, reload=False) # CORRECTED: Passing 'app' object directly
