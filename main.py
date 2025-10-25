@@ -68,6 +68,12 @@ DELETE_CODE = 16
 WARN_USER_ID = 17
 WARN_REASON = 18
 
+# Assigning to readable names for use in ConversationHandler
+TASK_DESC, TASK_LINK, TASK_REWARD, REJECT_REASON_WD, BROADCAST_MESSAGE, ANNOUNCEMENT_TEXT, \
+NEW_CODE_CODE, NEW_CODE_REWARD, NEW_CODE_USES, USER_MGT_ID, USER_MGT_DURATION, \
+RAIN_AMOUNT, RAIN_USERS, SUBMIT_TASK_REJECT_REASON, DELETE_TASK, DELETE_CODE, \
+WARN_USER_ID, WARN_REASON = range(19) # Corrected range to include all 19 states
+
 
 # --- Game Logic & WebSocket Manager ---
 class ConnectionManager:
@@ -108,7 +114,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Allow all origins for simplicity
+    allow_origins=["*"], # Allows all origins for simplicity, can be restricted later for security
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -154,6 +160,7 @@ async def get_initial_data(request: Request):
             "daily_claim_invites": user.daily_claim_invites,
             "can_claim_daily": can_claim_daily,
             "daily_bonus_req": DAILY_BONUS_INVITE_REQ,
+            "daily_bonus_amount": DAILY_BONUS, # Send daily bonus amount to frontend
             "announcement": announcement.value if announcement else "Welcome! No new announcements.",
             "tasks": [{"id": t.id, "description": t.description, "link": t.link, "reward": t.reward} for t in available_tasks],
             "withdrawals": [{"id": w.id, "amount": w.amount, "fee": w.fee, "status": w.status, "date": w.created_at.strftime('%Y-%m-%d')} for w in withdrawals],
@@ -423,7 +430,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: int, user_id: int):
                     "winner_id": room.winner_id
                 }))
     except WebSocketDisconnect:
-        manager.disconnect(room_id, websocket)
+        manager.disconnect(room.id, websocket)
         room = db_session.query(GameRoom).filter(GameRoom.id == room_id, GameRoom.status == 'active').first()
         if room and room.winner_id is None: # If game was active and no winner yet
             remaining_player_id = room.creator_id if room.opponent_id == user_id else room.opponent_id
@@ -433,7 +440,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: int, user_id: int):
                 prize_pool = room.bet_amount * 2; fee_amount = prize_pool * GAME_FEE_PERCENT; prize_after_fee = prize_pool - fee_amount
                 if winner_db: winner_db.balance += prize_after_fee
                 await ptb_app.bot.send_message(winner_id, f"🎉 Opponent disconnected! You win ₱{prize_after_fee:.2f} (Fee: ₱{fee_amount:.2f}).")
-            
             elif room.status == 'pending': # If room was pending and creator disconnected
                 creator = db_session.query(User).filter(User.id == room.creator_id).first()
                 if creator: creator.balance += room.bet_amount # Refund bet
@@ -485,7 +491,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🌧️ Rain Prize", callback_data="admin_rain"), InlineKeyboardButton("🧐 Review Submissions", callback_data="admin_pending_submissions")],
         [InlineKeyboardButton("⚙️ Withdrawal Maintenance", callback_data="admin_maintenance")],
         [InlineKeyboardButton("⚠️ Warn User", callback_data="admin_warn_user")],
-        [InlineKeyboardButton("🎲 Manage Games", callback_data="admin_manage_games")] # New button
+        [InlineKeyboardButton("🎲 Manage Games", callback_data="admin_manage_games")]
     ]
     await update.message.reply_text("👑 **Ultimate Admin Dashboard**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
@@ -500,12 +506,11 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     banned_users = db_session.query(User).filter(User.status == 'banned').count()
     restricted_users = db_session.query(User).filter(User.status == 'restricted').count()
     total_balance = sum(u.balance for u in db_session.query(User).all())
-    total_gift_tickets = sum(u.gift_tickets for u in db_session.query(User).all()) # New stat
+    total_gift_tickets = sum(u.gift_tickets for u in db_session.query(User).all())
     pending_withdrawals = db_session.query(Withdrawal).filter(Withdrawal.status == 'pending').count()
     pending_submissions = db_session.query(TaskSubmission).filter(TaskSubmission.status == 'pending').count()
     active_game_rooms = db_session.query(GameRoom).filter(GameRoom.status == 'active').count()
     pending_game_rooms = db_session.query(GameRoom).filter(GameRoom.status == 'pending').count()
-
 
     await query.message.reply_text(
         f"**📊 Bot Statistics:**\n\n"
@@ -527,7 +532,7 @@ async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE): a
 async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     active_users = db_session.query(User).filter(User.status == 'active').all()
     sent_count = 0
-    for user_db in active_users: # Renamed to user_db to avoid conflict with `user` from update
+    for user_db in active_users:
         try: await context.bot.copy_message(chat_id=user_db.id, from_chat_id=update.effective_chat.id, message_id=update.message.message_id); sent_count += 1
         except Exception as e: logger.error(f"Failed to broadcast to {user_db.id}: {e}")
     await update.message.reply_text(f"Broadcast sent to {sent_count}/{len(active_users)} active users."); return ConversationHandler.END
@@ -590,8 +595,7 @@ async def delete_code_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # --- User Management ---
 async def user_mgt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    keyboard = [[InlineKeyboardButton("Ban 🔨", callback_data="user_mgt_ban")], [InlineKeyboardButton("Unban 🔓", callback_data="user_mgt_unban")], [InlineKeyboardButton("Restrict Temp ⏳", callback_data="user_mgt_restrict")]]
+    query = update.callback_query; await query.answer(); keyboard = [[InlineKeyboardButton("Ban 🔨", callback_data="user_mgt_ban")], [InlineKeyboardButton("Unban 🔓", callback_data="user_mgt_unban")], [InlineKeyboardButton("Restrict Temp ⏳", callback_data="user_mgt_restrict")]]
     await query.message.edit_text("User Management:", reply_markup=InlineKeyboardMarkup(keyboard))
 async def user_mgt_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; context.user_data['mgt_action'] = query.data.split('_')[-1]
@@ -862,4 +866,4 @@ ptb_app.add_handler(CommandHandler("force_end_game", force_end_game_command)) # 
 # --- Main Entry ---
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port, reload=False) # CORRECTED: Passing 'app' object directly
+    uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
