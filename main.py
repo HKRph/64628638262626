@@ -5,7 +5,7 @@ from datetime import date, timedelta
 from typing import Optional, Dict, List
 from fastapi import FastAPI, Request, HTTPException, status, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, InputFile
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, ConversationHandler,
     MessageHandler, filters, CallbackQueryHandler
@@ -47,7 +47,7 @@ class GameRoom(Base): __tablename__ = "game_rooms"; id = Column(Integer, primary
 engine = create_engine("sqlite:///gtask_data.db"); Base.metadata.create_all(engine); Session = sessionmaker(bind=engine); db_session = Session()
 
 # --- Conversation States (DEFINED AT THE VERY TOP OF THE EXECUTABLE CODE) ---
-# These are explicitly assigned unique integers for clarity and reliability
+# Each state gets a unique integer value for clarity and reliability
 TASK_DESC = 0
 TASK_LINK = 1
 TASK_REWARD = 2
@@ -58,21 +58,15 @@ NEW_CODE_CODE = 6
 NEW_CODE_REWARD = 7
 NEW_CODE_USES = 8
 USER_MGT_ID = 9
-USER_MGT_ACTION = 10 # This is where admin picks ban/unban/restrict
+USER_MGT_ACTION_SELECT = 10 # This is where admin picks ban/unban/restrict
 USER_MGT_DURATION = 11
 RAIN_AMOUNT = 12
 RAIN_USERS = 13
 SUBMIT_TASK_REJECT_REASON = 14 # For task submission rejection
-DELETE_TASK = 15
-DELETE_CODE = 16
+DELETE_TASK_STATE = 15 # State for admin to select task to delete
+DELETE_CODE_STATE = 16 # State for admin to select code to delete
 WARN_USER_ID = 17
 WARN_REASON = 18
-
-# Assigning to readable names for use in ConversationHandler
-TASK_DESC, TASK_LINK, TASK_REWARD, REJECT_REASON_WD, BROADCAST_MESSAGE, ANNOUNCEMENT_TEXT, \
-NEW_CODE_CODE, NEW_CODE_REWARD, NEW_CODE_USES, USER_MGT_ID, USER_MGT_DURATION, \
-RAIN_AMOUNT, RAIN_USERS, SUBMIT_TASK_REJECT_REASON, DELETE_TASK, DELETE_CODE, \
-WARN_USER_ID, WARN_REASON = range(19) # Corrected range to include all 19 states
 
 
 # --- Game Logic & WebSocket Manager ---
@@ -114,7 +108,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Allows all origins for simplicity, can be restricted later for security
+    allow_origins=["*"], # Allow all origins for simplicity
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -384,7 +378,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: int, user_id: int):
                 elif (user_id == room.opponent_id and not room.opponent_move): room.opponent_move = move
                 else: await websocket.send_text(json.dumps({"type": "error", "message": "Invalid move or already made."})); continue
                 db_session.commit()
-                await manager.broadcast(room.id, json.dumps({"type": "move_made", "user_id": user_id, "move": move}))
+                await manager.broadcast(room.id, json.dumps({"type": "move_made", "user_id": user.id, "move": move}))
 
                 if room.creator_move and room.opponent_move:
                     winner_id = None; c_move = room.creator_move; o_move = room.opponent_move
@@ -491,7 +485,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🌧️ Rain Prize", callback_data="admin_rain"), InlineKeyboardButton("🧐 Review Submissions", callback_data="admin_pending_submissions")],
         [InlineKeyboardButton("⚙️ Withdrawal Maintenance", callback_data="admin_maintenance")],
         [InlineKeyboardButton("⚠️ Warn User", callback_data="admin_warn_user")],
-        [InlineKeyboardButton("🎲 Manage Games", callback_data="admin_manage_games")]
+        [InlineKeyboardButton("🎲 Manage Games", callback_data="admin_manage_games")] # New button
     ]
     await update.message.reply_text("👑 **Ultimate Admin Dashboard**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
@@ -506,11 +500,12 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     banned_users = db_session.query(User).filter(User.status == 'banned').count()
     restricted_users = db_session.query(User).filter(User.status == 'restricted').count()
     total_balance = sum(u.balance for u in db_session.query(User).all())
-    total_gift_tickets = sum(u.gift_tickets for u in db_session.query(User).all())
+    total_gift_tickets = sum(u.gift_tickets for u in db_session.query(User).all()) # New stat
     pending_withdrawals = db_session.query(Withdrawal).filter(Withdrawal.status == 'pending').count()
     pending_submissions = db_session.query(TaskSubmission).filter(TaskSubmission.status == 'pending').count()
     active_game_rooms = db_session.query(GameRoom).filter(GameRoom.status == 'active').count()
     pending_game_rooms = db_session.query(GameRoom).filter(GameRoom.status == 'pending').count()
+
 
     await query.message.reply_text(
         f"**📊 Bot Statistics:**\n\n"
@@ -532,7 +527,7 @@ async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE): a
 async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     active_users = db_session.query(User).filter(User.status == 'active').all()
     sent_count = 0
-    for user_db in active_users:
+    for user_db in active_users: # Renamed to user_db to avoid conflict with `user` from update
         try: await context.bot.copy_message(chat_id=user_db.id, from_chat_id=update.effective_chat.id, message_id=update.message.message_id); sent_count += 1
         except Exception as e: logger.error(f"Failed to broadcast to {user_db.id}: {e}")
     await update.message.reply_text(f"Broadcast sent to {sent_count}/{len(active_users)} active users."); return ConversationHandler.END
@@ -595,7 +590,8 @@ async def delete_code_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # --- User Management ---
 async def user_mgt_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer(); keyboard = [[InlineKeyboardButton("Ban 🔨", callback_data="user_mgt_ban")], [InlineKeyboardButton("Unban 🔓", callback_data="user_mgt_unban")], [InlineKeyboardButton("Restrict Temp ⏳", callback_data="user_mgt_restrict")]]
+    query = update.callback_query; await query.answer()
+    keyboard = [[InlineKeyboardButton("Ban 🔨", callback_data="user_mgt_ban")], [InlineKeyboardButton("Unban 🔓", callback_data="user_mgt_unban")], [InlineKeyboardButton("Restrict Temp ⏳", callback_data="user_mgt_restrict")]]
     await query.message.edit_text("User Management:", reply_markup=InlineKeyboardMarkup(keyboard))
 async def user_mgt_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; context.user_data['mgt_action'] = query.data.split('_')[-1]
