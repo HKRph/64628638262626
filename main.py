@@ -37,57 +37,98 @@ MIN_GAME_BET = 10.0 # Minimum bet for Jack and Poy
 
 # --- Database Setup ---
 Base = declarative_base()
-class User(Base): __tablename__ = "users"; id = Column(BigInteger, primary_key=True, autoincrement=False); balance = Column(Float, default=0.0); gift_tickets = Column(Integer, default=0); referral_count = Column(Integer, default=0); successful_referrals = Column(Integer, default=0); tasks_completed = Column(Integer, default=0); completed_task_ids = Column(Text, default="[]"); referrer_id = Column(BigInteger, ForeignKey("users.id"), nullable=True); status = Column(String, default="active"); status_until = Column(Date, nullable=True); last_login_date = Column(Date, nullable=True); daily_claim_invites = Column(Integer, default=0); claimed_milestones = Column(Text, default="{}")
-class Task(Base): __tablename__ = "tasks"; id = Column(Integer, primary_key=True); description = Column(String); link = Column(String); reward = Column(Float)
-class TaskSubmission(Base): __tablename__ = "task_submissions"; id = Column(Integer, primary_key=True); user_id = Column(BigInteger); task_id = Column(Integer); text_proof = Column(Text); photo_proof_base64 = Column(Text); status = Column(String, default="pending"); created_at = Column(Date, default=date.today())
-class Withdrawal(Base): __tablename__ = "withdrawals"; id = Column(Integer, primary_key=True); user_id = Column(BigInteger); amount = Column(Float); fee = Column(Float, default=0.0); method = Column(String); details = Column(String); status = Column(String, default="pending"); created_at = Column(Date, default=date.today())
-class RedeemCode(Base): __tablename__ = "redeem_codes"; id = Column(Integer, primary_key=True); code = Column(String, unique=True); reward = Column(Float); uses_left = Column(Integer, default=1)
-class SystemInfo(Base): __tablename__ = "system_info"; key = Column(String, primary_key=True); value = Column(String)
-class GameRoom(Base): __tablename__ = "game_rooms"; id = Column(Integer, primary_key=True); bet_amount = Column(Float); creator_id = Column(BigInteger); opponent_id = Column(BigInteger, nullable=True); status = Column(String, default="pending"); winner_id = Column(BigInteger, nullable=True); creator_move = Column(String, nullable=True); opponent_move = Column(String, nullable=True); created_at = Column(Date, default=date.today())
-engine = create_engine("sqlite:///gtask_data.db"); Base.metadata.create_all(engine); Session = sessionmaker(bind=engine); db_session = Session()
+class User(Base):
+    __tablename__ = "users"
+    id = Column(BigInteger, primary_key=True, autoincrement=False)
+    balance = Column(Float, default=0.0)
+    gift_tickets = Column(Integer, default=0)
+    referral_count = Column(Integer, default=0) # Total referred users
+    successful_referrals = Column(Integer, default=0) # Referred users who completed at least one task
+    tasks_completed = Column(Integer, default=0) # Total tasks completed by user
+    completed_task_ids = Column(Text, default="[]") # JSON list of task IDs completed by this user
+    referrer_id = Column(BigInteger, ForeignKey("users.id"), nullable=True)
+    status = Column(String, default="active") # active, banned, restricted
+    status_until = Column(Date, nullable=True) # For temporary restrictions
+    last_login_date = Column(Date, nullable=True) # For daily bonus claim
+    daily_claim_invites = Column(Integer, default=0) # Invites since last daily claim
+    claimed_milestones = Column(Text, default="{}") # JSON string for task milestones claimed
 
-# --- Conversation States (DEFINED AT THE TOP) ---
-# These are explicitly assigned unique integers to prevent NameErrors and ensure order
-STATE_TASK_DESC = 0
-STATE_TASK_LINK = 1
-STATE_TASK_REWARD = 2
-STATE_REJECT_WD_REASON = 3
-STATE_BROADCAST_MESSAGE = 4
-STATE_ANNOUNCEMENT_TEXT = 5
-STATE_NEW_CODE_CODE = 6
-STATE_NEW_CODE_REWARD = 7
-STATE_NEW_CODE_USES = 8
-STATE_USER_MGT_ID = 9
-STATE_USER_MGT_ACTION_SELECT = 10 # This is where admin picks ban/unban/restrict
-STATE_USER_MGT_DURATION = 11
-STATE_RAIN_AMOUNT = 12
-STATE_RAIN_USERS = 13
-STATE_REJECT_SUB_REASON = 14
-STATE_DELETE_TASK = 15
-STATE_DELETE_CODE = 16
-STATE_WARN_USER_ID = 17
-STATE_WARN_REASON = 18
+class Task(Base):
+    __tablename__ = "tasks"
+    id = Column(Integer, primary_key=True)
+    description = Column(String)
+    link = Column(String)
+    reward = Column(Float)
 
-# Assigning to readable names for use in ConversationHandler
-TASK_DESC = STATE_TASK_DESC
-TASK_LINK = STATE_TASK_LINK
-TASK_REWARD = STATE_TASK_REWARD
-REJECT_REASON_WD = STATE_REJECT_WD_REASON
-BROADCAST_MESSAGE = STATE_BROADCAST_MESSAGE
-ANNOUNCEMENT_TEXT = STATE_ANNOUNCEMENT_TEXT
-NEW_CODE_CODE = STATE_NEW_CODE_CODE
-NEW_CODE_REWARD = STATE_NEW_CODE_REWARD
-NEW_CODE_USES = STATE_NEW_CODE_USES
-USER_MGT_ID = STATE_USER_MGT_ID
-USER_MGT_ACTION = STATE_USER_MGT_ACTION_SELECT # Use this for the state where ID is collected for an action
-USER_MGT_DURATION = STATE_USER_MGT_DURATION
-RAIN_AMOUNT = STATE_RAIN_AMOUNT
-RAIN_USERS = STATE_RAIN_USERS
-SUBMIT_TASK_REJECT_REASON = STATE_REJECT_SUB_REASON
-DELETE_TASK = STATE_DELETE_TASK
-DELETE_CODE = STATE_DELETE_CODE
-WARN_USER_ID = STATE_WARN_USER_ID
-WARN_REASON = STATE_WARN_REASON
+class TaskSubmission(Base):
+    __tablename__ = "task_submissions"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(BigInteger)
+    task_id = Column(Integer)
+    text_proof = Column(Text)
+    photo_proof_base64 = Column(Text)
+    status = Column(String, default="pending") # pending, approved, rejected
+    created_at = Column(Date, default=date.today())
+
+class Withdrawal(Base):
+    __tablename__ = "withdrawals"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(BigInteger)
+    amount = Column(Float)
+    fee = Column(Float, default=0.0)
+    method = Column(String)
+    details = Column(String)
+    status = Column(String, default="pending") # pending, approved, rejected
+    created_at = Column(Date, default=date.today())
+
+class RedeemCode(Base):
+    __tablename__ = "redeem_codes"
+    id = Column(Integer, primary_key=True)
+    code = Column(String, unique=True)
+    reward = Column(Float)
+    uses_left = Column(Integer, default=1) # -1 for unlimited
+
+class SystemInfo(Base):
+    __tablename__ = "system_info"
+    key = Column(String, primary_key=True)
+    value = Column(String)
+
+class GameRoom(Base):
+    __tablename__ = "game_rooms"
+    id = Column(Integer, primary_key=True)
+    bet_amount = Column(Float)
+    creator_id = Column(BigInteger)
+    opponent_id = Column(BigInteger, nullable=True)
+    status = Column(String, default="pending") # pending, active, finished, cancelled
+    winner_id = Column(BigInteger, nullable=True) # ID of the winner, or -1 for draw
+    creator_move = Column(String, nullable=True) # rock, paper, scissors
+    opponent_move = Column(String, nullable=True) # rock, paper, scissors
+    created_at = Column(Date, default=date.today())
+
+engine = create_engine("sqlite:///gtask_data.db") # Using a specific DB name for clarity
+Base.metadata.create_all(engine); Session = sessionmaker(bind=engine); db_session = Session()
+
+# --- Conversation States (DEFINED AT THE VERY TOP OF THE EXECUTABLE CODE) ---
+# These are explicitly assigned unique integers for clarity and reliability
+TASK_DESC = 0
+TASK_LINK = 1
+TASK_REWARD = 2
+REJECT_REASON_WD = 3 # For withdrawal rejection
+BROADCAST_MESSAGE = 4
+ANNOUNCEMENT_TEXT = 5
+NEW_CODE_CODE = 6
+NEW_CODE_REWARD = 7
+NEW_CODE_USES = 8
+USER_MGT_ID = 9
+USER_MGT_ACTION = 10 # This is where admin picks ban/unban/restrict
+USER_MGT_DURATION = 11
+RAIN_AMOUNT = 12
+RAIN_USERS = 13
+SUBMIT_TASK_REJECT_REASON = 14 # For task submission rejection
+DELETE_TASK = 15
+DELETE_CODE = 16
+WARN_USER_ID = 17
+WARN_REASON = 18
 
 
 # --- Game Logic & WebSocket Manager ---
@@ -454,6 +495,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: int, user_id: int):
                 prize_pool = room.bet_amount * 2; fee_amount = prize_pool * GAME_FEE_PERCENT; prize_after_fee = prize_pool - fee_amount
                 if winner_db: winner_db.balance += prize_after_fee
                 await ptb_app.bot.send_message(winner_id, f"🎉 Opponent disconnected! You win ₱{prize_after_fee:.2f} (Fee: ₱{fee_amount:.2f}).")
+            
             elif room.status == 'pending': # If room was pending and creator disconnected
                 creator = db_session.query(User).filter(User.id == room.creator_id).first()
                 if creator: creator.balance += room.bet_amount # Refund bet
@@ -463,7 +505,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: int, user_id: int):
             room.winner_id = winner_id if 'winner_id' in locals() else None # Ensure winner_id is set
             db_session.commit()
             
-            # Notify the remaining player if any
             if remaining_player_id and remaining_player_id != user_id:
                 await manager.broadcast(room.id, json.dumps({"type": "game_over", "winner": remaining_player_id, "message": "Opponent disconnected."}))
     except Exception as e: logger.error(f"WebSocket Error in room {room_id} for user {user_id}: {e}", exc_info=True)
@@ -797,6 +838,7 @@ async def manage_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for r in pending_rooms:
             creator_user = db_session.query(User).filter(User.id == r.creator_id).first()
             msg += f"- ID `{r.id}`: ₱{r.bet_amount:.2f} by {creator_user.first_name if creator_user else 'Unknown'} ({r.creator_id})\n"
+            msg += f"  /cancel_game_{r.id}\n" # Admin can cancel pending games
     else: msg += "No pending rooms.\n"
 
     if active_rooms:
@@ -805,9 +847,44 @@ async def manage_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
             creator_user = db_session.query(User).filter(User.id == r.creator_id).first()
             opponent_user = db_session.query(User).filter(User.id == r.opponent_id).first()
             msg += f"- ID `{r.id}`: ₱{r.bet_amount:.2f} ({creator_user.first_name if creator_user else 'Unknown'} vs {opponent_user.first_name if opponent_user else 'Unknown'})\n"
+            msg += f"  /force_end_game_{r.id}\n" # Admin can force end active games
     else: msg += "No active games.\n"
     
     await query.message.edit_text(msg, parse_mode='Markdown')
+
+async def cancel_game_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_CHAT_ID: return
+    try:
+        room_id = int(context.args[0])
+        room = db_session.query(GameRoom).filter(GameRoom.id == room_id, GameRoom.status == 'pending').first()
+        if not room: await update.message.reply_text("Pending room not found."); return
+        
+        creator = db_session.query(User).filter(User.id == room.creator_id).first()
+        if creator: creator.balance += room.bet_amount; await ptb_app.bot.send_message(creator.id, f"Game Room #{room_id} cancelled by admin. Your bet returned.")
+        room.status = 'cancelled'; db_session.commit()
+        await update.message.reply_text(f"Game Room #{room_id} has been cancelled and bet refunded.")
+    except Exception as e: await update.message.reply_text(f"Error cancelling game: {e}")
+
+async def force_end_game_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_CHAT_ID: return
+    try:
+        room_id = int(context.args[0])
+        room = db_session.query(GameRoom).filter(GameRoom.id == room_id, GameRoom.status == 'active').first()
+        if not room: await update.message.reply_text("Active game not found."); return
+
+        creator = db_session.query(User).filter(User.id == room.creator_id).first()
+        opponent = db_session.query(User).filter(User.id == room.opponent_id).first()
+
+        creator.balance += room.bet_amount # Refund original bets
+        opponent.balance += room.bet_amount
+        
+        room.status = 'cancelled' # Set status to cancelled to prevent further moves
+        db_session.commit()
+
+        await ptb_app.bot.send_message(creator.id, f"Game Room #{room_id} has been force-ended by admin. Your bet returned.")
+        await ptb_app.bot.send_message(opponent.id, f"Game Room #{room_id} has been force-ended by admin. Your bet returned.")
+        await update.message.reply_text(f"Game Room #{room_id} has been force-ended and bets refunded.")
+    except Exception as e: await update.message.reply_text(f"Error force-ending game: {e}")
 
 
 # --- Add Handlers to the PTB Application ---
@@ -831,6 +908,7 @@ ptb_app.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
 ptb_app.add_handler(CallbackQueryHandler(manage_tasks, pattern="^admin_manage_tasks$"))
 ptb_app.add_handler(CallbackQueryHandler(delete_task_callback, pattern=r"^delete_task_\d+$"))
 ptb_app.add_handler(CallbackQueryHandler(manage_codes, pattern="^admin_manage_codes$"))
+ptb_app.add_handler(CallbackQueryHandler(remove_code_list, pattern="^remove_code_list$"))
 ptb_app.add_handler(CallbackQueryHandler(delete_code_callback, pattern=r"^delete_code_\d+$"))
 ptb_app.add_handler(CallbackQueryHandler(user_mgt_action_callback, pattern=r"^user_mgt_(ban|unban|restrict)$"))
 ptb_app.add_handler(CallbackQueryHandler(review_submissions, pattern="^admin_pending_submissions$"))
@@ -839,6 +917,8 @@ ptb_app.add_handler(CallbackQueryHandler(approve_withdrawal, pattern=r"^approve_
 ptb_app.add_handler(CallbackQueryHandler(maintenance_start, pattern="^admin_maintenance$"))
 ptb_app.add_handler(CallbackQueryHandler(toggle_maintenance_mode, pattern="^toggle_maintenance$"))
 ptb_app.add_handler(CallbackQueryHandler(manage_games, pattern="^admin_manage_games$"))
+ptb_app.add_handler(CommandHandler("cancel_game", cancel_game_command)) # Admin command to cancel games
+ptb_app.add_handler(CommandHandler("force_end_game", force_end_game_command)) # Admin command to force end games
 
 
 # --- Main Entry ---
