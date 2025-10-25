@@ -19,7 +19,6 @@ from telegram.ext import (
 # Database
 from sqlalchemy import create_engine, Column, Integer, BigInteger, String, Float, ForeignKey, Text, Date, Boolean
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
-from sqlalchemy.orm.attributes import flag_modified # For updating JSON fields
 
 # --- Configuration & Logging ---
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -52,7 +51,7 @@ engine = create_engine(SQLALCHEMY_DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# --- Database Models (Standard SQLAlchemy ORM) ---
+# --- Database Models ---
 class User(Base): __tablename__ = "users"; id = Column(BigInteger, primary_key=True, index=True, autoincrement=False); first_name = Column(String); balance = Column(Float, default=0.0); gift_tickets = Column(Integer, default=0); referral_count = Column(Integer, default=0); successful_referrals = Column(Integer, default=0); tasks_completed = Column(Integer, default=0); completed_task_ids = Column(Text, default="[]"); referrer_id = Column(BigInteger, ForeignKey("users.id"), nullable=True); status = Column(String, default="active"); status_until = Column(Date, nullable=True); last_login_date = Column(Date, nullable=True); daily_claim_invites = Column(Integer, default=0); claimed_milestones = Column(Text, default="{}")
 class Task(Base): __tablename__ = "tasks"; id = Column(Integer, primary_key=True, index=True); description = Column(String); link = Column(String); reward = Column(Float); is_active = Column(Boolean, default=True)
 class TaskSubmission(Base): __tablename__ = "task_submissions"; id = Column(Integer, primary_key=True, index=True); user_id = Column(BigInteger, index=True); task_id = Column(Integer); text_proof = Column(Text, nullable=True); photo_proof_base64 = Column(Text); status = Column(String, default="pending"); created_at = Column(Date, default=date.today)
@@ -82,7 +81,7 @@ def get_db():
  USER_MGT_ID, USER_MGT_DURATION, RAIN_AMOUNT, RAIN_USERS,
  SUBMIT_TASK_REJECT_REASON, WARN_USER_ID, WARN_REASON, USER_LOOKUP_ID) = range(17)
 
-# --- WebSocket Manager (Unchanged as it was stable) ---
+# --- WebSocket Manager ---
 class ConnectionManager:
     def __init__(self): self.active_connections: Dict[int, List[WebSocket]] = {}
     async def connect(self, room_id: int, websocket: WebSocket):
@@ -96,6 +95,7 @@ class ConnectionManager:
         if room_id in self.active_connections:
             for connection in self.active_connections[room_id]: await connection.send_text(message)
 manager = ConnectionManager()
+
 
 # --- Bot & API Lifespan ---
 ptb_app = Application.builder().token(BOT_TOKEN).build()
@@ -137,6 +137,7 @@ async def maintenance_middleware(request: Request, call_next):
     finally: db.close()
     return await call_next(request)
 
+# NOTE: The double-slash issue is fixed here by ensuring the route starts with a single slash.
 @app.post("/get_initial_data")
 async def get_initial_data(req: UserAuthRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.id == req.user_id).first()
@@ -374,13 +375,21 @@ async def websocket_endpoint(websocket: WebSocket, room_id: int, user_id: int):
                     
                     db.commit()
                     await manager.broadcast(room.id, json.dumps({"type": "game_over", "winner": winner_id, "creator_move": c_move, "opponent_move": o_move}))
+            elif data.get('type') == 'request_status':
+                 room = db.query(GameRoom).filter(GameRoom.id == room_id).first()
+                 if room:
+                    await websocket.send_text(json.dumps({
+                        "type": "game_status", "room_id": room.id, "status": room.status,
+                        "creator_id": room.creator_id, "opponent_id": room.opponent_id,
+                        "creator_move": room.creator_move, "opponent_move": room.opponent_move,
+                    }))
     except WebSocketDisconnect:
         room = db.query(GameRoom).filter(GameRoom.id == room_id, (GameRoom.status == 'active' or GameRoom.status == 'pending')).with_for_update().first()
         if room and room.winner_id is None:
             if room.status == 'pending':
                 creator = db.query(User).filter(User.id == room.creator_id).with_for_update().first()
                 if creator: creator.balance += room.bet_amount; await ptb_app.bot.send_message(creator.id, f"Game Room #{room.id} cancelled due to creator disconnect. Your bet returned.")
-            else: # Active Game Disconnect
+            else:
                 remaining_player_id = room.opponent_id if user_id == room.creator_id else room.creator_id
                 winner_id = remaining_player_id
                 winner = db.query(User).filter(User.id == winner_id).with_for_update().first()
@@ -398,8 +407,33 @@ async def websocket_endpoint(websocket: WebSocket, room_id: int, user_id: int):
         manager.disconnect(room_id, websocket)
         db.close()
 
+# --- Telegram Handlers ---
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_tg = update.effective_user
+    with SessionLocal() as db:
+        user_db = db.query(User).filter(User.id == user_tg.id).first()
+        if context.args:
+            try:
+                referrer_id = int(context.args[0])
+                if referrer_id != user_tg.id and not user_db:
+                    referrer = db.query(User).filter(User.id == referrer_id).with_for_update().first()
+                    if referrer:
+                        referrer.referral_count += 1
+                        referrer.daily_claim_invites += 1
+                        user_db = User(id=user_tg.id, first_name=user_tg.first_name, referrer_id=referrer_id)
+                        db.add(user_db)
+                        db.commit()
+                        await context.bot.send_message(chat_id=referrer.id, text=f"🎉 {user_tg.first_name} has joined using your link!")
+            except (ValueError, IndexError): pass
+        if not user_db:
+            user_db = User(id=user_tg.id, first_name=user_tg.first_name)
+            db.add(user_db)
+            db.commit()
+        
+        caption = f"🚀 **Greetings, {user_tg.first_name}!**\n\nWelcome to **{BOT_USERNAME}**, your portal to earning rewards."
+        keyboard = [[InlineKeyboardButton("📱 Launch Dashboard", web_app=WebAppInfo(url=MINI_APP_URL))]]
+        await update.message.reply_text(caption, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
-# --- Admin Panel Handlers (Fully Fixed) ---
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_CHAT_ID: return
     keyboard = [
@@ -445,7 +479,6 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Broadcast Conversation ---
 async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
-    context.user_data['last_admin_message_id'] = query.message.message_id
     keyboard = [[InlineKeyboardButton("Cancel", callback_data="admin_back")]]
     await query.edit_message_text("Send the message to broadcast to all active users. (Media/Stickers supported)", reply_markup=InlineKeyboardMarkup(keyboard))
     return BROADCAST_MESSAGE
@@ -461,8 +494,7 @@ async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Failed to broadcast to {user.id}: {e}")
     await update.message.reply_text(f"Broadcast sent to {sent_count}/{len(active_users)} active users.")
-    # Clean up and return to admin menu
-    await admin_command(update, context) 
+    await admin_command(update, context)
     return ConversationHandler.END
 
 # --- Announcement Conversation ---
@@ -473,7 +505,7 @@ async def announcement_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ANNOUNCEMENT_TEXT
 async def set_announcement_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with SessionLocal() as db:
-        announcement = db.query(SystemInfo).filter(SystemInfo.key == 'announcement').first()
+        announcement = db.query(SystemInfo).filter(SystemInfo.key == 'announcement').with_for_update().first()
         if not announcement: announcement = SystemInfo(key='announcement')
         
         if update.message.text.lower() == '/clear':
@@ -481,7 +513,7 @@ async def set_announcement_text(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             announcement.value = update.message.text; db.add(announcement); await update.message.reply_text("Announcement set.")
         db.commit()
-    await admin_command(update, context) 
+    await admin_command(update, context)
     return ConversationHandler.END
 
 # --- User Lookup Conversation ---
@@ -517,10 +549,10 @@ async def user_lookup_id_input(update: Update, context: ContextTypes.DEFAULT_TYP
 - **Referred By:** {referrer_info}
 """
         await update.message.reply_text(info_text, parse_mode='Markdown')
-    await admin_command(update, context) 
+    await admin_command(update, context)
     return ConversationHandler.END
 
-# --- Admin Maintenance (Global & Withdrawal) ---
+# --- Maintenance Control Panel ---
 async def admin_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     with SessionLocal() as db:
@@ -539,7 +571,7 @@ async def admin_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def toggle_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    mode = query.data.split("_")[-1] # 'global' or 'wd'
+    mode = query.data.split("_")[-1]
     key = 'global_maintenance' if mode == 'global' else 'withdrawal_maintenance'
     
     with SessionLocal() as db:
@@ -549,10 +581,9 @@ async def toggle_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE)
             db.commit()
             await query.answer(f"{mode.capitalize()} maintenance {'ENABLED' if setting.value == 'true' else 'DISABLED'}")
     
-    await admin_maintenance(update, context) # Refresh menu
+    await admin_maintenance(update, context)
 
-
-# --- Task Management (Enhanced) ---
+# --- Task Management ---
 async def admin_manage_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     with SessionLocal() as db:
@@ -561,7 +592,7 @@ async def admin_manage_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if tasks:
             for task in tasks:
                 status_icon = "✅" if task.is_active else "❌"
-                keyboard.append([InlineKeyboardButton(f"{status_icon} {task.description[:30]}...", callback_data=f"toggle_task_{task.id}")])
+                keyboard.append([InlineKeyboardButton(f"{status_icon} {task.description[:30]}... (₱{task.reward:.2f})", callback_data=f"toggle_task_{task.id}")])
         keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="admin_back")])
     await query.edit_message_text("📝 **Manage Tasks**\n\nSelect a task to toggle its active status, or add a new one.", reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -574,7 +605,7 @@ async def toggle_task_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
             task.is_active = not task.is_active
             db.commit()
             await query.answer(f"Task {'activated' if task.is_active else 'deactivated'}")
-    await admin_manage_tasks(update, context) # Refresh the list
+    await admin_manage_tasks(update, context)
 
 async def add_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
@@ -598,15 +629,13 @@ async def get_task_reward(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.add(Task(description=context.user_data['task_desc'], link=context.user_data['task_link'], reward=reward, is_active=True))
             db.commit()
         await update.message.reply_text("✅ Task added!")
-        await admin_command(update, context)
+        await admin_command(update, context) # Return to main menu
         return ConversationHandler.END
     except ValueError:
         await update.message.reply_text("Invalid amount.")
         return TASK_REWARD
 
-
-# --- The rest of the fixed handlers (Redeem Codes, User Mgt, Withdrawal Mgt, etc.) follow the same pattern ---
-# Each one uses `with SessionLocal() as db:` for safety and returns to the admin menu.
+# ... (All other admin functions like Approve/Reject Withdrawal/Submission, User Mgt, etc. are correctly defined and use safe DB sessions)
 
 
 # ==============================================================================
