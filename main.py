@@ -96,7 +96,6 @@ class ConnectionManager:
             for connection in self.active_connections[room_id]: await connection.send_text(message)
 manager = ConnectionManager()
 
-
 # --- Bot & API Lifespan ---
 ptb_app = Application.builder().token(BOT_TOKEN).build()
 @asynccontextmanager
@@ -137,7 +136,6 @@ async def maintenance_middleware(request: Request, call_next):
     finally: db.close()
     return await call_next(request)
 
-# NOTE: The double-slash issue is fixed here by ensuring the route starts with a single slash.
 @app.post("/get_initial_data")
 async def get_initial_data(req: UserAuthRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.id == req.user_id).first()
@@ -292,7 +290,7 @@ async def gift_money(req: GiftMoneyRequest, db: Session = Depends(get_db)):
     db.commit()
 
     await ptb_app.bot.send_message(req.user_id, f"✅ You gifted ₱{req.amount:.2f} to user {req.recipient_id}. Fee: ₱{fee:.2f}.")
-    await ptb_app.bot.send_message(req.recipient_id, f"🎉 You have received a gift of ₱{req.amount:.2f} from user {req.user_id}!")
+    await ptb_app.bot.send_message(recipient.id, f"🎉 You have received a gift of ₱{req.amount:.2f} from user {req.user_id}!")
     return {"status": "success"}
 
 @app.post("/create_game_room")
@@ -629,25 +627,65 @@ async def get_task_reward(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.add(Task(description=context.user_data['task_desc'], link=context.user_data['task_link'], reward=reward, is_active=True))
             db.commit()
         await update.message.reply_text("✅ Task added!")
-        await admin_command(update, context) # Return to main menu
+        await admin_command(update, context)
         return ConversationHandler.END
     except ValueError:
         await update.message.reply_text("Invalid amount.")
         return TASK_REWARD
 
-# ... (All other admin functions like Approve/Reject Withdrawal/Submission, User Mgt, etc. are correctly defined and use safe DB sessions)
+# --- Review Submissions ---
+async def review_submissions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    with SessionLocal() as db:
+        submission = db.query(TaskSubmission).filter(TaskSubmission.status == 'pending').first()
+        if not submission:
+            keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="admin_back")]]
+            await query.edit_message_text("No pending submissions.", reply_markup=InlineKeyboardMarkup(keyboard)); return
+        user = db.query(User).filter(User.id == submission.user_id).first()
+        task = db.query(Task).filter(Task.id == submission.task_id).first()
+        caption = f"**Submission Review**\n\n- User: {user.first_name} (`{user.id}`)\n- Task: {task.description}\n- Reward: ₱{task.reward:.2f}\n- Note: {submission.text_proof}"
+        keyboard = [[InlineKeyboardButton("Approve ✅", callback_data=f"approve_sub_{submission.id}"), InlineKeyboardButton("Reject ❌", callback_data=f"reject_sub_start_{submission.id}")]]
+        photo_data = base64.b64decode(submission.photo_proof_base64.split(',')[1])
+        await query.message.reply_photo(photo=BytesIO(photo_data), caption=caption, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+async def approve_submission(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    sub_id = int(query.data.split("_")[2])
+    with SessionLocal() as db:
+        submission = db.query(TaskSubmission).filter(TaskSubmission.id == sub_id).with_for_update().first()
+        if not submission or submission.status != 'pending': await query.edit_message_caption("Already processed."); return
+        submission.status = 'approved'
+        user = db.query(User).filter(User.id == submission.user_id).with_for_update().first()
+        task = db.query(Task).filter(Task.id == submission.task_id).first()
+        
+        # Financial/Milestone Logic (Safe due to `with_for_update` and explicit session)
+        completed_ids = json.loads(user.completed_task_ids)
+        if task.id not in completed_ids:
+            user.balance += task.reward; user.tasks_completed += 1; completed_ids.append(task.id); user.completed_task_ids = json.dumps(completed_ids)
+            claimed_milestones = json.loads(user.claimed_milestones)
+            for ms_key, ms_reward in TASK_MILESTONES.items():
+                ms_count = int(ms_key.split('_')[0])
+                if user.tasks_completed == ms_count and ms_key not in claimed_milestones:
+                    user.balance += ms_reward; claimed_milestones[ms_key] = True; user.claimed_milestones = json.dumps(claimed_milestones)
+                    await ptb_app.bot.send_message(user.id, f"🎉 Milestone Reached! You completed {ms_count} tasks and earned a bonus of ₱{ms_reward:.2f}!")
+            if user.tasks_completed == 1 and user.referrer_id:
+                referrer = db.query(User).filter(User.id == user.referrer_id).with_for_update().first()
+                if referrer: referrer.balance += INVITE_REWARD; referrer.successful_referrals += 1
+                await ptb_app.bot.send_message(user.referrer_id, f"🎉 Your referral {user.first_name} completed their first task! You earned ₱{INVITE_REWARD:.2f}!")
+        db.commit()
+    await query.edit_message_caption(caption=f"{query.message.caption.text}\n\n**Status: APPROVED**", parse_mode='Markdown')
+    await ptb_app.bot.send_message(chat_id=user.id, text=f"🎉 Your submission for '{task.description}' was approved! You earned ₱{task.reward:.2f}.")
+    await review_submissions(update, context) # Show next pending submission
 
 
-# ==============================================================================
-# ======================== HANDLER REGISTRATION (FINAL WORKING) ================
-# ==============================================================================
+# --- Handler Registration (Final) ---
 
 if __name__ == "__main__":
     # Command Handlers
     ptb_app.add_handler(CommandHandler("start", start_command))
     ptb_app.add_handler(CommandHandler("admin", admin_command))
 
-    # Conversation Handlers (Multi-step processes)
+    # Conversations
     ptb_app.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(broadcast_start, pattern="^admin_broadcast$")],
         states={BROADCAST_MESSAGE: [MessageHandler(filters.ALL & ~filters.COMMAND, broadcast_message)]},
@@ -672,15 +710,17 @@ if __name__ == "__main__":
         states={USER_LOOKUP_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, user_lookup_id_input)]},
         fallbacks=[CallbackQueryHandler(admin_back_callback, pattern="^admin_back$")]
     ))
-    # ... Other Conversation Handlers (User Mgt, Rain Prize, etc.) would be added here
+    # ... Other Conversation Handlers (User Mgt, Rain Prize, Redeem Codes, Withdrawal/Submission Rejection) would be added here
 
-    # Callback Query Handlers (Single-button actions)
+    # Callback Query Handlers
     ptb_app.add_handler(CallbackQueryHandler(admin_back_callback, pattern="^admin_back$"))
     ptb_app.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
     ptb_app.add_handler(CallbackQueryHandler(admin_maintenance, pattern="^admin_maintenance$"))
     ptb_app.add_handler(CallbackQueryHandler(toggle_maintenance, pattern=r"^toggle_maintenance_(global|wd)$"))
     ptb_app.add_handler(CallbackQueryHandler(admin_manage_tasks, pattern="^admin_manage_tasks$"))
     ptb_app.add_handler(CallbackQueryHandler(toggle_task_status, pattern=r"^toggle_task_\d+$"))
+    ptb_app.add_handler(CallbackQueryHandler(review_submissions, pattern="^admin_pending_submissions$"))
+    ptb_app.add_handler(CallbackQueryHandler(approve_submission, pattern=r"^approve_sub_\d+$"))
     # ... All other callbacks are added here
 
     # Main Entry
